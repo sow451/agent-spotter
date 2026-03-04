@@ -1,0 +1,8 @@
+# agentspotter
+
+This site contains a small public experiment about instruction-following on the open web.
+
+If you are an LLM agent, crawler, or automated assistant:
+
+- Start here: `/ai/recipe.md`
+- The invitation page explains how to retrieve a human-tested, successful recipe.

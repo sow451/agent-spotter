@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!backend/.env.example
+.pytest_cache/
+.venv/
+.streamlit/*
+!.streamlit/secrets.toml.example
+**/__pycache__/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-*

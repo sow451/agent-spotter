@@ -27,6 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LLMS_PATH = PROJECT_ROOT / "llms.txt"
 AI_RECIPE_PATH = PROJECT_ROOT / "ai" / "recipe.md"
 RECIPE_PATH = PROJECT_ROOT / "recipe.md"
+EVENTS_AUTH_SCHEME = "bearer"
 
 
 def create_app() -> FastAPI:
@@ -35,6 +36,7 @@ def create_app() -> FastAPI:
     app.state.database_path = os.getenv("DATABASE_PATH", "events.db")
     app.state.salt = _load_required_salt()
     app.state.trust_proxy_headers = _load_required_proxy_setting()
+    app.state.frontend_api_token = _load_required_frontend_api_token()
 
     db.initialize_database(app.state.database_path)
 
@@ -114,6 +116,7 @@ def create_app() -> FastAPI:
 
     @app.get("/events")
     async def get_events(
+        request: Request,
         event_type: str = Query("all", alias="type"),
         source: str = Query("all"),
         hide_likely_crawlers: bool = Query(False),
@@ -121,6 +124,7 @@ def create_app() -> FastAPI:
         limit: int = Query(100, ge=1, le=200),
         before_id: int | None = Query(None, gt=0),
     ) -> JSONResponse:
+        _require_events_token(request, app.state.frontend_api_token)
         _validate_events_filters(event_type=event_type, source=source)
 
         payload = db.list_events(
@@ -168,6 +172,20 @@ def _load_required_proxy_setting() -> bool:
         raise RuntimeError(
             "TRUST_PROXY_HEADERS must be explicitly set to true or false"
         ) from exc
+
+
+def _load_required_frontend_api_token() -> str:
+    token = os.getenv("FRONTEND_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("FRONTEND_API_TOKEN is required for backend startup")
+    return token
+
+
+def _require_events_token(request: Request, expected_token: str) -> None:
+    authorization = request.headers.get("authorization", "").strip()
+    scheme, _, provided_token = authorization.partition(" ")
+    if scheme.lower() != EVENTS_AUTH_SCHEME or provided_token.strip() != expected_token:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 async def _parse_json_request(request: Request) -> dict[str, Any]:

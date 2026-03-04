@@ -9,11 +9,14 @@ from fastapi.testclient import TestClient
 from backend import db
 from backend.main import RECIPE_PATH, create_app
 
+EVENTS_AUTH_HEADER = {"Authorization": "Bearer frontend-test-token"}
+
 
 def _make_test_client(database_path, monkeypatch, *, trust_proxy_headers: str = "false") -> TestClient:
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.setenv("SALT", "test-salt")
     monkeypatch.setenv("TRUST_PROXY_HEADERS", trust_proxy_headers)
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
     return TestClient(create_app())
 
 
@@ -428,6 +431,16 @@ def test_create_app_requires_explicit_proxy_setting(database_path, monkeypatch) 
         create_app()
 
 
+def test_create_app_requires_frontend_api_token(database_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.delenv("FRONTEND_API_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="FRONTEND_API_TOKEN is required"):
+        create_app()
+
+
 def test_post_hi_rate_limits_after_three_successes_per_minute(client, db_connection) -> None:
     for index in range(3):
         response = client.post("/hi", json={"agent_name": f"client-{index}"})
@@ -484,6 +497,7 @@ def test_get_events_exposes_revised_counters_and_hides_private_fields(client) ->
     response = client.get(
         "/events",
         params={"type": "hi", "source": "agent", "q": "token", "limit": 10},
+        headers=EVENTS_AUTH_HEADER,
     )
 
     assert response.status_code == 200
@@ -516,7 +530,7 @@ def test_get_events_exposes_ten_minute_refresh_contract(database_path, monkeypat
 
     with _make_test_client(database_path, monkeypatch) as client:
         client.get("/agent.txt")
-        response = client.get("/events", params={"limit": 10})
+        response = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
 
     assert response.status_code == 200
     assert response.json()["refresh"] == {
@@ -536,7 +550,7 @@ def test_startup_rebuild_recovers_missing_stats_cache(client, database_path, db_
     db_connection.commit()
 
     with _make_test_client(database_path, monkeypatch) as rebuilt_client:
-        response = rebuilt_client.get("/events", params={"limit": 10})
+        response = rebuilt_client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
 
     counters = response.json()["counters"]
     assert counters["fetch"] == 1
@@ -556,6 +570,7 @@ def test_startup_rejects_unversioned_legacy_database(database_path, monkeypatch)
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.setenv("SALT", "test-salt")
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
 
     with pytest.raises(db.SchemaCompatibilityError, match="incompatible database schema detected"):
         create_app()
@@ -619,6 +634,7 @@ def test_startup_rejects_malformed_hi_tokens_table(database_path, monkeypatch) -
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.setenv("SALT", "test-salt")
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
 
     with pytest.raises(db.SchemaCompatibilityError, match="incompatible database schema detected"):
         create_app()
@@ -629,9 +645,13 @@ def test_get_events_validates_filters_and_preserves_fetch_rows_when_source_filte
     client.post("/hi", json={"agent_name": "Manual One", "source": "manual"})
     client.post("/hi", json={"agent_name": "Scout", "source": "agent"})
 
-    invalid_type = client.get("/events", params={"type": "bogus"})
-    invalid_source = client.get("/events", params={"source": "bogus"})
-    filtered = client.get("/events", params={"type": "all", "source": "agent", "limit": 10})
+    invalid_type = client.get("/events", params={"type": "bogus"}, headers=EVENTS_AUTH_HEADER)
+    invalid_source = client.get("/events", params={"source": "bogus"}, headers=EVENTS_AUTH_HEADER)
+    filtered = client.get(
+        "/events",
+        params={"type": "all", "source": "agent", "limit": 10},
+        headers=EVENTS_AUTH_HEADER,
+    )
 
     assert invalid_type.status_code == 400
     assert invalid_type.json() == {"detail": "invalid type"}
@@ -655,10 +675,30 @@ def test_get_events_can_hide_likely_crawler_rows(client) -> None:
     client.get("/agent.txt", headers={"User-Agent": "GPTBot/1.0"})
     client.get("/agent.txt", headers={"User-Agent": "Mozilla/5.0"})
 
-    response = client.get("/events", params={"hide_likely_crawlers": True, "limit": 10})
+    response = client.get(
+        "/events",
+        params={"hide_likely_crawlers": True, "limit": 10},
+        headers=EVENTS_AUTH_HEADER,
+    )
 
     assert response.status_code == 200
     events = response.json()["events"]
     assert len(events) == 1
     assert events[0]["user_agent"] == "Mozilla/5.0"
     assert events[0]["likely_crawler"] is False
+
+
+def test_get_events_requires_frontend_api_token(client) -> None:
+    missing = client.get("/events", params={"limit": 10})
+    invalid = client.get(
+        "/events",
+        params={"limit": 10},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    valid = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
+
+    assert missing.status_code == 401
+    assert missing.json() == {"detail": "unauthorized"}
+    assert invalid.status_code == 401
+    assert invalid.json() == {"detail": "unauthorized"}
+    assert valid.status_code == 200

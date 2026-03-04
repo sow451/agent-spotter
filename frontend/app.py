@@ -47,6 +47,10 @@ PROFANITY_PATTERN = re.compile(
 )
 
 
+class FrontendConfigurationError(RuntimeError):
+    pass
+
+
 def _safe_text(value: object) -> str:
     if value is None:
         return ""
@@ -58,6 +62,46 @@ def _load_context_markdown() -> str:
         return CONTEXT_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
         return "# Context\n\nThe context document could not be found."
+
+
+def _streamlit_secret(key: str) -> str | None:
+    if st is None:
+        return None
+
+    secrets = getattr(st, "secrets", None)
+    if secrets is None:
+        return None
+
+    try:
+        value = secrets[key]
+    except Exception:
+        try:
+            value = secrets.get(key)
+        except Exception:
+            return None
+
+    normalized = _safe_text(value).strip()
+    return normalized or None
+
+
+def _configured_backend_url() -> str:
+    env_value = _safe_text(os.getenv("BACKEND_URL")).strip()
+    if env_value:
+        return env_value.rstrip("/")
+
+    secret_value = _streamlit_secret("BACKEND_URL")
+    if secret_value:
+        return secret_value.rstrip("/")
+
+    return DEFAULT_BACKEND_URL
+
+
+def _configured_frontend_api_token() -> str | None:
+    env_value = _safe_text(os.getenv("FRONTEND_API_TOKEN")).strip()
+    if env_value:
+        return env_value
+
+    return _streamlit_secret("FRONTEND_API_TOKEN")
 
 
 def _current_view() -> str:
@@ -316,6 +360,11 @@ def _fetch_events_page(
 ) -> dict[str, Any]:
     if requests is None:
         raise RuntimeError("requests is required to fetch frontend data")
+    frontend_api_token = _configured_frontend_api_token()
+    if not frontend_api_token:
+        raise FrontendConfigurationError(
+            "Set FRONTEND_API_TOKEN in Streamlit secrets to load live event data."
+        )
 
     params: dict[str, Any] = {
         "type": event_type,
@@ -329,6 +378,7 @@ def _fetch_events_page(
 
     response = requests.get(
         f"{backend_url}/events",
+        headers={"Authorization": f"Bearer {frontend_api_token}"},
         params=params,
         timeout=5,
     )
@@ -523,6 +573,15 @@ def _sync_feed(
             limit=filters["limit"],
             before_id=before_id,
         )
+    except FrontendConfigurationError as exc:
+        st.session_state["feed_error"] = str(exc)
+        st.session_state["feed_notice"] = ""
+        if mode == "replace":
+            st.session_state["feed_events"] = []
+            st.session_state["feed_counters"] = {}
+            st.session_state["feed_has_more"] = False
+            st.session_state["feed_signature"] = signature
+        return
     except REQUEST_FETCH_ERRORS:
         st.session_state["feed_error"] = BACKEND_UNAVAILABLE_MESSAGE
         st.session_state["feed_notice"] = ""
@@ -1309,7 +1368,7 @@ def _render_event_feed(events: list[dict[str, Any]]) -> None:
             }
         )
 
-    st.dataframe(table_rows, hide_index=True, use_container_width=True)
+    st.dataframe(table_rows, hide_index=True, width="stretch")
 
     st.caption("This is the latest loaded window of matching events.")
 
@@ -1327,7 +1386,7 @@ def main() -> None:
     _init_state()
     _render_css()
 
-    backend_url = os.getenv("BACKEND_URL", DEFAULT_BACKEND_URL).rstrip("/")
+    backend_url = _configured_backend_url()
 
     if _current_view() == "context":
         st.markdown(

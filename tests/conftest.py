@@ -26,6 +26,7 @@ def app(database_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.setenv("SALT", "test-salt")
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
     return create_app()
 
 

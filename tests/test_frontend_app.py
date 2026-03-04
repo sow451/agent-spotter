@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import pytest
 
 from streamlit.testing.v1 import AppTest
 
@@ -35,6 +36,7 @@ class _FakeColumn:
 class _FakeStreamlit:
     def __init__(self) -> None:
         self.session_state: dict[str, object] = {}
+        self.secrets: dict[str, object] = {}
         self.page_config_calls: list[dict[str, object]] = []
         self.markdown_calls: list[tuple[str, bool]] = []
         self.write_calls: list[object] = []
@@ -43,7 +45,7 @@ class _FakeStreamlit:
         self.code_calls: list[tuple[str, str | None]] = []
         self.metric_calls: list[tuple[str, object, object]] = []
         self.table_calls: list[object] = []
-        self.dataframe_calls: list[tuple[object, bool, bool]] = []
+        self.dataframe_calls: list[tuple[object, bool, object]] = []
         self.info_calls: list[str] = []
         self.error_calls: list[str] = []
 
@@ -68,8 +70,8 @@ class _FakeStreamlit:
     def table(self, data) -> None:
         self.table_calls.append(data)
 
-    def dataframe(self, data, hide_index: bool = False, use_container_width: bool = False) -> None:
-        self.dataframe_calls.append((data, hide_index, use_container_width))
+    def dataframe(self, data, hide_index: bool = False, width=None) -> None:
+        self.dataframe_calls.append((data, hide_index, width))
 
     def subheader(self, _body: str) -> None:
         return None
@@ -102,6 +104,7 @@ def test_frontend_module_imports_without_running_streamlit_bootstrap() -> None:
 
 def test_frontend_runs_with_real_streamlit_testing_and_handles_backend_failure(monkeypatch) -> None:
     monkeypatch.setenv("BACKEND_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
 
     app_test = AppTest.from_file("frontend/app.py").run(timeout=20)
 
@@ -210,6 +213,108 @@ def test_manual_curl_snippet_uses_configured_backend_url() -> None:
 
     assert "https://backend.example/hi" in snippet
     assert "http://localhost:8000/hi" not in snippet
+
+
+def test_configured_backend_url_uses_streamlit_secret_when_env_missing(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    fake_st.secrets["BACKEND_URL"] = "https://secret-backend.example/"
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.delenv("BACKEND_URL", raising=False)
+
+    assert app._configured_backend_url() == "https://secret-backend.example"
+
+
+def test_configured_backend_url_prefers_env_over_streamlit_secret(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    fake_st.secrets["BACKEND_URL"] = "https://secret-backend.example/"
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setenv("BACKEND_URL", "https://env-backend.example/")
+
+    assert app._configured_backend_url() == "https://env-backend.example"
+
+
+def test_configured_frontend_api_token_uses_streamlit_secret_when_env_missing(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    fake_st.secrets["FRONTEND_API_TOKEN"] = "secret-token"
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.delenv("FRONTEND_API_TOKEN", raising=False)
+
+    assert app._configured_frontend_api_token() == "secret-token"
+
+
+def test_configured_frontend_api_token_prefers_env_over_streamlit_secret(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    fake_st.secrets["FRONTEND_API_TOKEN"] = "secret-token"
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "env-token")
+
+    assert app._configured_frontend_api_token() == "env-token"
+
+
+def test_fetch_events_page_sends_frontend_api_token(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.delenv("FRONTEND_API_TOKEN", raising=False)
+    fake_st.secrets["FRONTEND_API_TOKEN"] = "secret-token"
+
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"events": [], "counters": {}, "refresh": {}, "has_more": False}
+
+    class _FakeRequests:
+        RequestException = RuntimeError
+
+        @staticmethod
+        def get(url: str, *, headers=None, params=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["params"] = params
+            captured["timeout"] = timeout
+            return _FakeResponse()
+
+    monkeypatch.setattr(app, "requests", _FakeRequests)
+
+    payload = app._fetch_events_page(
+        "https://backend.example",
+        event_type="all",
+        source="all",
+        hide_likely_crawlers=False,
+        q="",
+        limit=25,
+    )
+
+    assert payload["has_more"] is False
+    assert captured["url"] == "https://backend.example/events"
+    assert captured["headers"] == {"Authorization": "Bearer secret-token"}
+    assert captured["timeout"] == 5
+
+
+def test_fetch_events_page_requires_frontend_api_token(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.delenv("FRONTEND_API_TOKEN", raising=False)
+    fake_st.secrets.pop("FRONTEND_API_TOKEN", None)
+
+    with pytest.raises(app.FrontendConfigurationError, match="Set FRONTEND_API_TOKEN"):
+        app._fetch_events_page(
+            "https://backend.example",
+            event_type="all",
+            source="all",
+            hide_likely_crawlers=False,
+            q="",
+            limit=25,
+        )
 
 
 def test_render_sidebar_mentions_path_specific_reward_and_limitations(monkeypatch) -> None:
@@ -644,11 +749,11 @@ def test_render_event_feed_masks_profane_messages_and_keeps_plain_text_rows(monk
     )
 
     assert len(fake_st.dataframe_calls) == 1
-    rows, hide_index, use_container_width = fake_st.dataframe_calls[0]
+    rows, hide_index, width = fake_st.dataframe_calls[0]
     markdown_text = " ".join(body for body, _ in fake_st.markdown_calls)
 
     assert hide_index is True
-    assert use_container_width is True
+    assert width == "stretch"
     assert rows[0]["Name"] == "<b>agent</b>"
     assert rows[0]["Message"] == "****"
     assert rows[1]["Name"] == "Viewer"

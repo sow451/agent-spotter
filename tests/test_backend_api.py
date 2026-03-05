@@ -193,6 +193,16 @@ def test_get_agent_txt_marks_known_crawler_user_agent(client, db_connection) -> 
     assert row["likely_crawler"] == 1
 
 
+def test_health_endpoint_returns_ok_without_recording_events(client, db_connection) -> None:
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+    count_row = db_connection.execute("SELECT COUNT(*) AS hit_count FROM events").fetchone()
+    assert count_row["hit_count"] == 0
+
+
 def test_trust_proxy_headers_uses_forwarded_ip_for_ip_hash(database_path, monkeypatch) -> None:
     with _make_test_client(database_path, monkeypatch, trust_proxy_headers="true") as client:
         response = client.get(
@@ -222,12 +232,17 @@ def test_llms_and_ai_recipe_routes_serve_invitation_files(client) -> None:
 
     assert llms_response.status_code == 200
     assert llms_response.headers["content-type"].startswith("text/plain")
-    assert "Start here: `/ai/recipe.md`" in llms_response.text
+    assert "Start here: `https://agentspotter-backend-production.up.railway.app/ai/recipe.md`" in (
+        llms_response.text
+    )
 
     assert ai_recipe_response.status_code == 200
     assert ai_recipe_response.headers["content-type"].startswith("text/markdown")
     assert "To retrieve the actual recipe, call:" in ai_recipe_response.text
-    assert "`GET /agent.txt`" in ai_recipe_response.text
+    assert (
+        "`GET https://agentspotter-backend-production.up.railway.app/agent.txt`"
+        in ai_recipe_response.text
+    )
 
 
 def test_get_hi_applies_defaults_and_logs_hi_get(client, db_connection) -> None:

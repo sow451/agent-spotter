@@ -63,6 +63,10 @@ def create_app() -> FastAPI:
             raise
         return PlainTextResponse(response_text, media_type="text/plain")
 
+    @app.get("/health")
+    async def get_health() -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
     @app.get("/llms.txt")
     async def get_llms_txt() -> PlainTextResponse:
         return PlainTextResponse(_read_text_file(LLMS_PATH), media_type="text/plain")

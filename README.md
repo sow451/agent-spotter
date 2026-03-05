@@ -44,6 +44,7 @@ Operational note:
 - If you do not mount a volume, SQLite writes stay inside the container and can disappear after a redeploy or container replacement.
 - To prevent accidental ephemeral writes, startup now hard-fails in Railway-like runtimes when `DATABASE_PATH` is missing.
 - If you reuse an older mounted `events.db` with an incompatible schema, rotate or remove that file before deploying this version.
+- For health/liveness checks in automation, use `GET /health` instead of `GET /agent.txt`; `/agent.txt` intentionally records a `fetch` event and will pollute experiment counters.
 
 ## Streamlit frontend deployment
 

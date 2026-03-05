@@ -38,10 +38,9 @@ def _http_get(url: str, *, headers: dict[str, str] | None = None) -> tuple[int, 
         return exc.code, exc.read().decode("utf-8")
 
 
-def _wait_for_events_ready(
+def _wait_for_backend_ready(
     base_url: str,
     *,
-    token: str,
     timeout_seconds: int = 45,
     process: subprocess.Popen[str] | None = None,
 ) -> None:
@@ -58,10 +57,7 @@ def _wait_for_events_ready(
                 f"stderr:\n{stderr}"
             )
         try:
-            status, body = _http_get(
-                f"{base_url}/events?limit=1",
-                headers={"Authorization": f"Bearer {token}"},
-            )
+            status, body = _http_get(f"{base_url}/health")
             last_status = status
             last_body = body
             if status == 200:
@@ -129,7 +125,7 @@ def _running_backend_server(database_path: Path):
     )
 
     try:
-        _wait_for_events_ready(base_url, token=FRONTEND_API_TOKEN, process=process)
+        _wait_for_backend_ready(base_url, process=process)
         yield base_url
     finally:
         if process is not None and process.poll() is None:
@@ -192,7 +188,7 @@ def test_deployment_smoke_dockerized_backend_startup_and_events_auth() -> None:
     try:
         base_url = f"http://127.0.0.1:{host_port}"
         try:
-            _wait_for_events_ready(base_url, token=FRONTEND_API_TOKEN)
+            _wait_for_backend_ready(base_url)
         except AssertionError as exc:
             logs = subprocess.run(
                 [docker_bin, "logs", container_id],

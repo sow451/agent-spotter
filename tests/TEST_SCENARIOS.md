@@ -13,12 +13,13 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 
 - Run completed: 2026-03-05 IST (Asia/Kolkata)
 - Command used: `./.venv/bin/python -m pytest -q`
-- Result: `61 passed, 2 skipped`
+- Result: `63 passed, 2 skipped`
 - Failures: none
 
 ## Backend Scenarios Covered
 
 - `GET /agent.txt` returns machine-readable instructions, issues a one-time token, logs `fetch`, and stores the token server-side.
+- `GET /health` provides a non-mutating readiness/liveness probe and does not write `fetch` or any other events.
 - `GET /agent.txt` is rate-limited and returns `429` under sustained abuse instead of writing unbounded fetch rows.
 - Known crawler user agents are flagged as likely crawlers, and trusted proxy mode uses the first `X-Forwarded-For` hop for IP hashing.
 - `GET /hi` works as the easy fallback path and applies defaults for omitted `agent`, `source`, and `message`.
@@ -61,6 +62,7 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 - Deployment-focused integration tests exist for:
   - Dockerized backend startup + `/events` auth smoke
   - frontend helper successfully fetching authenticated `/events` from a live backend process
+  - readiness checks use `/health` so deployment smoke probes do not distort experiment counters
 
 ## Remaining Gaps
 

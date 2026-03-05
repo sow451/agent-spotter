@@ -28,12 +28,20 @@ LLMS_PATH = PROJECT_ROOT / "llms.txt"
 AI_RECIPE_PATH = PROJECT_ROOT / "ai" / "recipe.md"
 RECIPE_PATH = PROJECT_ROOT / "recipe.md"
 EVENTS_AUTH_SCHEME = "bearer"
+DEFAULT_DATABASE_PATH = "events.db"
+MANAGED_RUNTIME_MARKERS = {
+    "RAILWAY_ENVIRONMENT",
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_SERVICE_ID",
+}
+PRODUCTION_ENV_VALUE_KEYS = {"APP_ENV", "ENVIRONMENT", "ENV"}
+PRODUCTION_ENV_VALUES = {"prod", "production"}
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="agentspotter backend")
 
-    app.state.database_path = os.getenv("DATABASE_PATH", "events.db")
+    app.state.database_path = _load_database_path()
     app.state.salt = _load_required_salt()
     app.state.trust_proxy_headers = _load_required_proxy_setting()
     app.state.frontend_api_token = _load_required_frontend_api_token()
@@ -47,7 +55,12 @@ def create_app() -> FastAPI:
             salt=app.state.salt,
             trust_proxy_headers=app.state.trust_proxy_headers,
         )
-        response_text = _record_fetch_response(app.state.database_path, context)
+        try:
+            response_text = _record_fetch_response(app.state.database_path, context)
+        except Exception as exc:
+            if _is_db_exception(exc, "RateLimitExceeded"):
+                raise HTTPException(status_code=429, detail="rate limit exceeded") from exc
+            raise
         return PlainTextResponse(response_text, media_type="text/plain")
 
     @app.get("/llms.txt")
@@ -71,13 +84,18 @@ def create_app() -> FastAPI:
             salt=app.state.salt,
             trust_proxy_headers=app.state.trust_proxy_headers,
         )
-        result = _record_hi_get(
-            database_path=app.state.database_path,
-            context=context,
-            agent_name=normalized["agent_name"],
-            source_kind=normalized["source_kind"],
-            message=normalized["message"],
-        )
+        try:
+            result = _record_hi_get(
+                database_path=app.state.database_path,
+                context=context,
+                agent_name=normalized["agent_name"],
+                source_kind=normalized["source_kind"],
+                message=normalized["message"],
+            )
+        except Exception as exc:
+            if _is_db_exception(exc, "RateLimitExceeded"):
+                raise HTTPException(status_code=429, detail="rate limit exceeded") from exc
+            raise
         return JSONResponse(result)
 
     @app.post("/hi")
@@ -125,6 +143,20 @@ def create_app() -> FastAPI:
         before_id: int | None = Query(None, gt=0),
     ) -> JSONResponse:
         _require_events_token(request, app.state.frontend_api_token)
+        context = db.build_request_context(
+            request=request,
+            salt=app.state.salt,
+            trust_proxy_headers=app.state.trust_proxy_headers,
+        )
+        try:
+            db.enforce_events_rate_limit(
+                app.state.database_path,
+                context,
+            )
+        except Exception as exc:
+            if _is_db_exception(exc, "RateLimitExceeded"):
+                raise HTTPException(status_code=429, detail="rate limit exceeded") from exc
+            raise
         _validate_events_filters(event_type=event_type, source=source)
 
         payload = db.list_events(
@@ -148,6 +180,28 @@ def _env_flag(raw_value: str) -> bool:
     if normalized in FALSE_ENV_VALUES:
         return False
     raise ValueError(f"invalid boolean value: {raw_value}")
+
+
+def _load_database_path() -> str:
+    configured_path = os.getenv("DATABASE_PATH", "").strip()
+    if configured_path:
+        return configured_path
+    if _is_managed_runtime():
+        raise RuntimeError(
+            "DATABASE_PATH is required in managed runtime environments. "
+            "Set DATABASE_PATH to a persistent mount (Railway: /data/events.db)."
+        )
+    return DEFAULT_DATABASE_PATH
+
+
+def _is_managed_runtime() -> bool:
+    if any(os.getenv(marker, "").strip() for marker in MANAGED_RUNTIME_MARKERS):
+        return True
+    for key in PRODUCTION_ENV_VALUE_KEYS:
+        value = os.getenv(key, "").strip().lower()
+        if value in PRODUCTION_ENV_VALUES:
+            return True
+    return False
 
 
 def _load_required_salt() -> str:

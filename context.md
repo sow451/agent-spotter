@@ -277,7 +277,7 @@ Token behavior:
 
 ### `GET /events`
 
-This is the public stats feed for the dashboard.
+This is the dashboard stats feed for the Streamlit frontend.
 
 - It returns counters and a bounded event feed.
   - `fetch`
@@ -286,8 +286,67 @@ This is the public stats feed for the dashboard.
   - `hi_post_token`
   - `hi_total`
   - `ratio_total`
+- It requires a valid bearer token in `Authorization` (`FRONTEND_API_TOKEN`).
+- In deployment, Streamlit calls this endpoint server-side and attaches the token.
 - In the current frontend, this powers the homepage counters, the latest loaded event table, and the message banner.
 - Richer frontend-only analysis panels or extra dashboard controls are not part of the current product contract.
+
+## Deployment Architecture (Streamlit + Railway)
+
+The deployed setup has two separate services:
+
+- Railway runs the FastAPI backend (`/agent.txt`, `/hi`, `/events`).
+- Streamlit Cloud runs the dashboard UI and fetches `/events` from the backend.
+
+```text
+                  (public internet)
+          ┌─────────────────────────────────┐
+          │  Bots / agents / users          │
+          └───────────────┬─────────────────┘
+                          │
+                          │ GET /agent.txt, GET/POST /hi
+                          ▼
+                ┌───────────────────────┐
+                │ Railway FastAPI       │
+                │ backend/main.py       │
+                └─────────┬─────────────┘
+                          │ read/write
+                          ▼
+                ┌───────────────────────┐
+                │ SQLite events.db      │
+                │ (on Railway volume)   │
+                └───────────────────────┘
+
+
+          ┌─────────────────────────────────┐
+          │ Your browser (dashboard user)   │
+          └───────────────┬─────────────────┘
+                          │ loads Streamlit app
+                          ▼
+                ┌───────────────────────┐
+                │ Streamlit Cloud       │
+                │ frontend/app.py       │
+                └─────────┬─────────────┘
+                          │ server-side GET /events
+                          │ Authorization: Bearer FRONTEND_API_TOKEN
+                          ▼
+                ┌───────────────────────┐
+                │ Railway FastAPI       │
+                │ GET /events           │
+                └───────────────────────┘
+```
+
+Response flow for the dashboard:
+
+1. Streamlit loads, reads `BACKEND_URL` and `FRONTEND_API_TOKEN`, and calls `GET /events`.
+2. The backend validates the bearer token.
+3. On success, backend returns:
+   - `refresh`
+   - `counters`
+   - `events`
+   - `has_more`
+4. Streamlit renders the counters, event feed, and message banner.
+
 
 ## Non-Goals
 

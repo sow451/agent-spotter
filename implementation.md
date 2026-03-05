@@ -69,23 +69,77 @@ agentspotter/
 
 - `SALT` (required)
 - `TRUST_PROXY_HEADERS` (required, `true` or `false`; set `true` only when the backend is behind a trusted reverse proxy that sets `X-Forwarded-For`)
-- `DATABASE_PATH` (optional, default `events.db`)
+- `DATABASE_PATH` (required in managed runtimes such as Railway; local development may omit it and use default `events.db`)
+- `FRONTEND_API_TOKEN` (required; bearer token required by `GET /events`)
 
 ### Frontend environment variables
 
 - `BACKEND_URL` (required)
+- `FRONTEND_API_TOKEN` (required to fetch `GET /events`; may come from env var or Streamlit secrets)
+
+## Deployment Topology (Railway + Streamlit)
+
+Production deploy uses two services:
+
+- Railway: FastAPI backend + SQLite storage
+- Streamlit Cloud: frontend dashboard
+
+```text
+                Public callers (agents / users)
+                           |
+                           | GET /agent.txt, GET/POST /hi
+                           v
+                 Railway FastAPI backend
+                           |
+                           | read/write
+                           v
+                   SQLite events.db
+                  (mounted persistent volume)
+
+                Dashboard viewer in browser
+                           |
+                           | load Streamlit app
+                           v
+                  Streamlit Cloud frontend
+                           |
+                           | server-side GET /events
+                           | Authorization: Bearer FRONTEND_API_TOKEN
+                           v
+                 Railway FastAPI backend
+```
+
+Operational config locations:
+
+- Railway service variables:
+  - `SALT`
+  - `TRUST_PROXY_HEADERS`
+  - `DATABASE_PATH`
+  - `FRONTEND_API_TOKEN`
+- Streamlit app secrets (or env):
+  - `BACKEND_URL`
+  - `FRONTEND_API_TOKEN`
 
 ### Backend startup sequence
 
 1. Load env vars.
-2. Open SQLite connection with `check_same_thread=False`.
-3. Apply SQLite PRAGMAs:
+2. Resolve `DATABASE_PATH`:
+   - managed runtime (for example Railway): startup fails if `DATABASE_PATH` is missing
+   - local dev: fallback default is `events.db`
+3. Open SQLite connection with `check_same_thread=False`.
+4. Apply strict schema compatibility guard against preexisting DBs:
+   - required columns
+   - required PK shape
+   - required `NOT NULL` columns
+   - critical `CHECK` constraints
+   - required `hi_tokens(fetch_event_id) -> events(id)` FK
+   - required index presence + definitions
+5. Apply SQLite PRAGMAs:
    - `journal_mode=WAL`
-   - `synchronous=NORMAL`
+   - `synchronous=FULL`
    - `busy_timeout=5000`
-4. Create tables and indexes if missing.
-5. Ensure the cache row exists.
-6. Rebuild cache if missing or invalid.
+6. Create tables and indexes if missing.
+7. Ensure the cache row exists.
+8. Rebuild cache if missing or invalid.
 
 ## Storage Design
 
@@ -151,7 +205,7 @@ Rules:
 - token is optional to use
 - token is single-use
 - a token is expired when `current_time >= expires_at`
-- expired tokens remain stored until cleanup, but are invalid
+- expired tokens are deleted by lazy cleanup during startup and accepted write paths
 - tokens are never re-issued by `GET /hi` or `POST /hi`
 
 ## Table: `source_windows`
@@ -296,6 +350,10 @@ GET /agent.txt
 - issue one token valid for 60 seconds
 - store the token in `hi_tokens`
 - return plain text
+- apply per-IP abuse controls:
+  - max 60 successful `fetch` writes per 60 seconds
+  - max 600 successful `fetch` writes per 3600 seconds
+  - over limit returns `429` and does not write event/token
 
 ### Response
 
@@ -385,6 +443,10 @@ Helpful interpretation for callers:
 - do not issue or validate tokens
 - update counters
 - return a reward response
+- apply per-IP abuse controls:
+  - max 20 successful `hi_get` writes per 60 seconds
+  - max 240 successful `hi_get` writes per 3600 seconds
+  - over limit returns `429` and does not write event
 
 ### Successful response
 
@@ -478,6 +540,10 @@ Key:
 
 Rules:
 
+- max 60 successful `fetch` writes per 60 seconds
+- max 600 successful `fetch` writes per 3600 seconds
+- max 20 successful `hi_get` writes per 60 seconds
+- max 240 successful `hi_get` writes per 3600 seconds
 - max 3 successful `hi_post` writes per 60 seconds
 - max 20 successful `hi_post` writes per 3600 seconds
 
@@ -562,7 +628,18 @@ HTTP status:
 
 ### Purpose
 
-- return counters and a bounded event feed
+- return counters and a bounded event feed for the Streamlit dashboard
+
+### Request authentication
+
+Required header:
+
+- `Authorization: Bearer <FRONTEND_API_TOKEN>`
+
+Rules:
+
+- missing or invalid bearer token returns `401`
+- this endpoint is intended for server-side calls from the Streamlit frontend
 
 ### Query parameters
 
@@ -721,10 +798,11 @@ Rebuild process:
 
 ### Token cleanup
 
-MVP token cleanup may happen lazily:
+MVP token cleanup happens lazily and continuously:
 
-- expired tokens can remain stored
-- they simply fail validation
+- expired `hi_tokens` rows are deleted at backend startup
+- expired `hi_tokens` rows are deleted on accepted write paths (`GET /agent.txt`, `GET /hi`, `POST /hi`)
+- deleted rows are no longer available for audit lookups
 
 ## Frontend Contract
 
@@ -751,18 +829,22 @@ Backend tests must cover:
 
 - `GET /agent.txt` logs `fetch`
 - `GET /agent.txt` returns recipe text and a token
+- `GET /agent.txt` enforces rate limits
 - `GET /hi` logs `hi_get`
 - `GET /hi` applies defaults when fields are omitted
 - `GET /hi` rejects invalid `source`
+- `GET /hi` enforces rate limits
 - `POST /hi` accepts all-optional body and applies defaults
 - `POST /hi` accepts missing token
 - `POST /hi` accepts valid token and marks `token_used = 1`
 - `POST /hi` rejects invalid or expired token
 - `POST /hi` enforces rate limits
+- expired token rows are cleaned up during write activity
 - repeated sources do not inflate current-day unique counters
 - `/events` returns exact counter shape
 - `/events` returns exact row shape
 - `/events` never exposes token material or `ip_hash`
+- `/events` rejects missing or invalid bearer tokens with `401`
 
 Frontend tests must cover:
 

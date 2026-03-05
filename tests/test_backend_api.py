@@ -27,6 +27,114 @@ def _extract_token(agent_txt_body: str) -> str:
     raise AssertionError("token line missing from /agent.txt response")
 
 
+def _clear_managed_runtime_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "RAILWAY_ENVIRONMENT",
+        "RAILWAY_PROJECT_ID",
+        "RAILWAY_SERVICE_ID",
+        "APP_ENV",
+        "ENVIRONMENT",
+        "ENV",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def _create_compatible_schema(
+    connection: sqlite3.Connection,
+    *,
+    include_event_type_check: bool = True,
+    include_hi_tokens_foreign_key: bool = True,
+    include_required_indexes: bool = True,
+) -> None:
+    event_type_column = (
+        "event_type TEXT NOT NULL CHECK (event_type IN ('fetch', 'hi_get', 'hi_post'))"
+        if include_event_type_check
+        else "event_type TEXT NOT NULL"
+    )
+    foreign_key_clause = (
+        ", FOREIGN KEY(fetch_event_id) REFERENCES events(id)"
+        if include_hi_tokens_foreign_key
+        else ""
+    )
+
+    connection.execute(
+        f"""
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            {event_type_column},
+            path TEXT NOT NULL,
+            agent_name TEXT,
+            message TEXT,
+            source_kind TEXT NOT NULL CHECK (source_kind IN ('none', 'unknown', 'manual', 'agent')),
+            user_agent TEXT NOT NULL DEFAULT '',
+            ip_hash TEXT NOT NULL,
+            likely_crawler INTEGER NOT NULL CHECK (likely_crawler IN (0, 1)),
+            token_used INTEGER NOT NULL CHECK (token_used IN (0, 1))
+        )
+        """
+    )
+    connection.execute(
+        f"""
+        CREATE TABLE hi_tokens (
+            token_hash TEXT PRIMARY KEY,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            fetch_event_id INTEGER NOT NULL,
+            issued_ip_hash TEXT NOT NULL
+            {foreign_key_clause}
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE source_windows (
+            window_day TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            token_used INTEGER NOT NULL CHECK (token_used IN (0, 1)),
+            ip_hash TEXT NOT NULL,
+            event_count INTEGER NOT NULL DEFAULT 1,
+            first_ts TEXT NOT NULL,
+            last_ts TEXT NOT NULL,
+            PRIMARY KEY (window_day, event_type, source_kind, token_used, ip_hash)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE stats_cache (
+            cache_key TEXT PRIMARY KEY,
+            cache_window_day TEXT NOT NULL,
+            fetch_count INTEGER NOT NULL DEFAULT 0,
+            hi_get_count INTEGER NOT NULL DEFAULT 0,
+            hi_post_count INTEGER NOT NULL DEFAULT 0,
+            hi_post_token_count INTEGER NOT NULL DEFAULT 0,
+            hi_total_count INTEGER NOT NULL DEFAULT 0,
+            hi_unknown_count INTEGER NOT NULL DEFAULT 0,
+            hi_manual_count INTEGER NOT NULL DEFAULT 0,
+            fetch_unique_utc_day INTEGER NOT NULL DEFAULT 0,
+            hi_total_unique_utc_day INTEGER NOT NULL DEFAULT 0,
+            hi_post_token_unique_utc_day INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    if include_required_indexes:
+        connection.execute("CREATE INDEX idx_events_ts_desc ON events(ts DESC)")
+        connection.execute("CREATE INDEX idx_events_event_id ON events(event_type, id DESC)")
+        connection.execute(
+            "CREATE INDEX idx_events_ip_event_ts ON events(ip_hash, event_type, ts DESC)"
+        )
+        connection.execute("CREATE INDEX idx_events_source_id ON events(source_kind, id DESC)")
+        connection.execute(
+            "CREATE INDEX idx_events_crawler_id ON events(likely_crawler, id DESC)"
+        )
+        connection.execute("CREATE INDEX idx_hi_tokens_expires ON hi_tokens(expires_at)")
+
+
 def test_get_agent_txt_returns_token_and_logs_fetch(client, db_connection) -> None:
     response = client.get("/agent.txt", headers={"User-Agent": "ExampleBrowser/1.0"})
 
@@ -409,6 +517,7 @@ def test_post_hi_rejects_invalid_agent_name_types_and_lengths(client, db_connect
 
 
 def test_create_app_requires_explicit_salt(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.delenv("SALT", raising=False)
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
@@ -418,6 +527,7 @@ def test_create_app_requires_explicit_salt(database_path, monkeypatch) -> None:
 
 
 def test_create_app_requires_explicit_proxy_setting(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.setenv("SALT", "test-salt")
     monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
@@ -432,6 +542,7 @@ def test_create_app_requires_explicit_proxy_setting(database_path, monkeypatch) 
 
 
 def test_create_app_requires_frontend_api_token(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.setenv("SALT", "test-salt")
     monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
@@ -439,6 +550,31 @@ def test_create_app_requires_frontend_api_token(database_path, monkeypatch) -> N
 
     with pytest.raises(RuntimeError, match="FRONTEND_API_TOKEN is required"):
         create_app()
+
+
+def test_create_app_requires_database_path_in_managed_runtime(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+
+    with pytest.raises(RuntimeError, match="DATABASE_PATH is required in managed runtime"):
+        create_app()
+
+
+def test_create_app_allows_default_database_path_for_local_dev(tmp_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+
+    app = create_app()
+
+    assert app.state.database_path == "events.db"
+    assert (tmp_path / "events.db").exists()
 
 
 def test_post_hi_rate_limits_after_three_successes_per_minute(client, db_connection) -> None:
@@ -473,6 +609,137 @@ def test_post_hi_rate_limits_after_twenty_successes_per_hour(database_path, monk
 
     assert blocked.status_code == 429
     assert blocked.json() == {"detail": "rate limit exceeded"}
+
+
+def test_get_agent_txt_rate_limits_after_two_successes_per_minute(database_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "FETCH_RATE_LIMIT_PER_MINUTE", 2)
+    monkeypatch.setattr(db, "FETCH_RATE_LIMIT_PER_HOUR", 20)
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        first = client.get("/agent.txt")
+        second = client.get("/agent.txt")
+        blocked = client.get("/agent.txt")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert blocked.status_code == 429
+    assert blocked.json() == {"detail": "rate limit exceeded"}
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        fetch_count = connection.execute(
+            "SELECT COUNT(*) AS hit_count FROM events WHERE event_type = 'fetch'"
+        ).fetchone()["hit_count"]
+        token_count = connection.execute(
+            "SELECT COUNT(*) AS hit_count FROM hi_tokens"
+        ).fetchone()["hit_count"]
+
+    assert fetch_count == 2
+    assert token_count == 2
+
+
+def test_get_hi_rate_limits_after_two_successes_per_minute(database_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "HI_GET_RATE_LIMIT_PER_MINUTE", 2)
+    monkeypatch.setattr(db, "HI_GET_RATE_LIMIT_PER_HOUR", 20)
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        first = client.get("/hi")
+        second = client.get("/hi")
+        blocked = client.get("/hi")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert blocked.status_code == 429
+    assert blocked.json() == {"detail": "rate limit exceeded"}
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        hi_get_count = connection.execute(
+            "SELECT COUNT(*) AS hit_count FROM events WHERE event_type = 'hi_get'"
+        ).fetchone()["hit_count"]
+
+    assert hi_get_count == 2
+
+
+def test_write_paths_update_stats_without_full_rebuild_in_hot_path(database_path, monkeypatch) -> None:
+    with _make_test_client(database_path, monkeypatch) as client:
+        def _fail_if_called(*_args, **_kwargs):
+            raise AssertionError("full stats rebuild should not run during accepted writes")
+
+        monkeypatch.setattr(db, "rebuild_stats_cache", _fail_if_called)
+
+        fetch_response = client.get("/agent.txt")
+        token = _extract_token(fetch_response.text)
+        hi_get_response = client.get("/hi", params={"source": "manual"})
+        hi_post_token_response = client.post(
+            "/hi",
+            json={"agent_name": "Scout", "source": "agent", "token": token},
+        )
+        events_response = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
+
+    assert fetch_response.status_code == 200
+    assert hi_get_response.status_code == 200
+    assert hi_post_token_response.status_code == 200
+    assert events_response.status_code == 200
+    counters = events_response.json()["counters"]
+    assert counters["fetch"] == 1
+    assert counters["hi_get"] == 1
+    assert counters["hi_post"] == 0
+    assert counters["hi_post_token"] == 1
+    assert counters["hi_total"] == 2
+
+
+def test_get_events_rate_limits_after_two_successes_per_minute(database_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "EVENTS_RATE_LIMIT_PER_MINUTE", 2)
+    monkeypatch.setattr(db, "EVENTS_RATE_LIMIT_PER_HOUR", 20)
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        first = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
+        second = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
+        blocked = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert blocked.status_code == 429
+    assert blocked.json() == {"detail": "rate limit exceeded"}
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        hit_count = connection.execute(
+            """
+            SELECT COUNT(*) AS hit_count
+            FROM endpoint_hits
+            WHERE endpoint = '/events'
+            """
+        ).fetchone()["hit_count"]
+    assert hit_count == 2
+
+
+def test_fetch_path_cleans_up_expired_tokens(database_path, monkeypatch) -> None:
+    base_time = datetime(2026, 3, 4, 0, 0, 0, tzinfo=timezone.utc)
+    current_time = {"value": base_time}
+    monkeypatch.setattr(db, "utc_now", lambda: current_time["value"])
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        first_fetch = client.get("/agent.txt")
+        first_token = _extract_token(first_fetch.text)
+
+        current_time["value"] = base_time + timedelta(seconds=61)
+        second_fetch = client.get("/agent.txt")
+        second_token = _extract_token(second_fetch.text)
+
+    assert first_fetch.status_code == 200
+    assert second_fetch.status_code == 200
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        token_rows = connection.execute(
+            "SELECT token_hash FROM hi_tokens ORDER BY issued_at ASC"
+        ).fetchall()
+
+    assert len(token_rows) == 1
+    assert token_rows[0]["token_hash"] == db._hash_token(second_token)
+    assert token_rows[0]["token_hash"] != db._hash_token(first_token)
 
 
 def test_get_events_exposes_revised_counters_and_hides_private_fields(client) -> None:
@@ -561,6 +828,7 @@ def test_startup_rebuild_recovers_missing_stats_cache(client, database_path, db_
 
 
 def test_startup_rejects_unversioned_legacy_database(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE events (id INTEGER PRIMARY KEY)")
         connection.execute("CREATE TABLE source_windows (window_day TEXT)")
@@ -577,6 +845,7 @@ def test_startup_rejects_unversioned_legacy_database(database_path, monkeypatch)
 
 
 def test_startup_rejects_malformed_hi_tokens_table(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             """
@@ -637,6 +906,51 @@ def test_startup_rejects_malformed_hi_tokens_table(database_path, monkeypatch) -
     monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
 
     with pytest.raises(db.SchemaCompatibilityError, match="incompatible database schema detected"):
+        create_app()
+
+
+def test_startup_rejects_schema_missing_required_indexes(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    with sqlite3.connect(database_path) as connection:
+        _create_compatible_schema(connection, include_required_indexes=False)
+        connection.commit()
+
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+
+    with pytest.raises(db.SchemaCompatibilityError, match="missing required indexes"):
+        create_app()
+
+
+def test_startup_rejects_schema_with_missing_hi_token_foreign_key(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    with sqlite3.connect(database_path) as connection:
+        _create_compatible_schema(connection, include_hi_tokens_foreign_key=False)
+        connection.commit()
+
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+
+    with pytest.raises(db.SchemaCompatibilityError, match="foreign key"):
+        create_app()
+
+
+def test_startup_rejects_schema_with_missing_event_type_check(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    with sqlite3.connect(database_path) as connection:
+        _create_compatible_schema(connection, include_event_type_check=False)
+        connection.commit()
+
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+
+    with pytest.raises(db.SchemaCompatibilityError, match="CHECK constraint"):
         create_app()
 
 
@@ -702,3 +1016,20 @@ def test_get_events_requires_frontend_api_token(client) -> None:
     assert invalid.status_code == 401
     assert invalid.json() == {"detail": "unauthorized"}
     assert valid.status_code == 200
+
+
+def test_get_events_rejects_malformed_authorization_headers(client) -> None:
+    malformed_authorization_headers = [
+        {"Authorization": "Basic frontend-test-token"},
+        {"Authorization": "Bearer"},
+        {"Authorization": "Bearer   "},
+        {"Authorization": "Bearer: frontend-test-token"},
+        {"Authorization": "Bearer\tfrontend-test-token"},
+        {"Authorization": "Bearer,frontend-test-token"},
+        {"Authorization": "Bearer frontend-test-token extra"},
+    ]
+
+    for headers in malformed_authorization_headers:
+        response = client.get("/events", params={"limit": 10}, headers=headers)
+        assert response.status_code == 401
+        assert response.json() == {"detail": "unauthorized"}

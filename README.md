@@ -30,6 +30,7 @@ Required for durable data:
 - Add a Railway `Volume`
 - Mount it at `/data`
 - Set `DATABASE_PATH=/data/events.db`
+- The backend now fails startup in managed runtimes (for example Railway) if `DATABASE_PATH` is not explicitly set
 
 Where these values go in Railway:
 
@@ -41,6 +42,7 @@ Where these values go in Railway:
 Operational note:
 
 - If you do not mount a volume, SQLite writes stay inside the container and can disappear after a redeploy or container replacement.
+- To prevent accidental ephemeral writes, startup now hard-fails in Railway-like runtimes when `DATABASE_PATH` is missing.
 - If you reuse an older mounted `events.db` with an incompatible schema, rotate or remove that file before deploying this version.
 
 ## Streamlit frontend deployment

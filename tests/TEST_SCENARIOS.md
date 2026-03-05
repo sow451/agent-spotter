@@ -11,16 +11,18 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 
 ## Latest Automated Run
 
-- Run completed: 2026-03-04 18:19:34 IST (Asia/Kolkata)
+- Run completed: 2026-03-05 IST (Asia/Kolkata)
 - Command used: `./.venv/bin/python -m pytest -q`
-- Result: `42 passed`
+- Result: `61 passed, 2 skipped`
 - Failures: none
 
 ## Backend Scenarios Covered
 
 - `GET /agent.txt` returns machine-readable instructions, issues a one-time token, logs `fetch`, and stores the token server-side.
+- `GET /agent.txt` is rate-limited and returns `429` under sustained abuse instead of writing unbounded fetch rows.
 - Known crawler user agents are flagged as likely crawlers, and trusted proxy mode uses the first `X-Forwarded-For` hop for IP hashing.
 - `GET /hi` works as the easy fallback path and applies defaults for omitted `agent`, `source`, and `message`.
+- `GET /hi` is rate-limited and returns `429` under sustained abuse.
 - `GET /hi` also covers the explicit documented path with `agent`, `source`, and `message` query params.
 - `POST /hi` accepts `{}` as valid input, applies defaults, and returns the revised response shape with `signal`, counters, ratios, and `reward_message`.
 - Blank-string optional fields normalize back to defaults, and invalid `agent_name` types/lengths are rejected.
@@ -34,10 +36,15 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 - `/events` rows include `token_used` and still do not expose private fields such as IP hashes or token material.
 - `/events` rejects invalid filters and preserves fetch rows when `type=all` is combined with a `source` filter.
 - `/events` can hide likely crawler rows from the visible feed while preserving the global counters contract.
+- `/events` requires bearer auth and rejects missing, wrong, and malformed `Authorization` headers.
+- `/events` now has per-IP endpoint rate limiting and returns `429` when the per-minute/per-hour threshold is exceeded.
 - Startup still fails fast when `SALT` or `TRUST_PROXY_HEADERS` are missing or invalid.
-- Legacy/incompatible SQLite files are rejected instead of being silently accepted.
+- Managed runtime startup fails fast when `DATABASE_PATH` is missing; local dev fallback is still supported.
+- Legacy/incompatible SQLite files are rejected with strict schema checks (columns, keys, constraints, FK, and required indexes).
 - A malformed preexisting `hi_tokens` table is rejected at startup instead of failing later during token issuance.
 - Rebuilding a missing `stats_cache` row reconstructs counters from stored events.
+- Expired `hi_tokens` are cleaned up on startup and during write paths.
+- Accepted write paths increment stats cache directly and avoid full cache rebuilds in the hot write path.
 
 ## Frontend Scenarios Covered
 
@@ -51,16 +58,34 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 - Event cards still render user-provided text through plain-text paths rather than markdown.
 - The main event table also masks profane messages and keeps user-provided values in plain-text dataframe rows.
 - There is now one real `streamlit.testing` smoke test that runs the actual app and confirms it renders without exceptions even when backend fetches fail.
+- Deployment-focused integration tests exist for:
+  - Dockerized backend startup + `/events` auth smoke
+  - frontend helper successfully fetching authenticated `/events` from a live backend process
 
 ## Remaining Gaps
 
-- Most frontend tests still use the fake harness; we have one real Streamlit smoke test now, but not broad real-widget interaction coverage.
-- We still do not cover every optional-field edge case (for example every bad type/length combination for every field on both GET and POST).
-- We still do not have browser-level verification of the rendered page.
+1. Most frontend tests still use the fake harness; we still do not have broad real-widget interaction coverage.
+2. We still do not cover every optional-field edge case (for example every bad type/length combination for every field on both GET and POST).
+3. We still do not have browser-level verification of the rendered page.
+4. Two deployment/integration tests are environment-skippable and require Docker + local socket bind permissions to run in CI.
 
-## Practical Next Tests
+## Post-Launch Fixes
 
-1. Add direct positive-path frontend coverage for the real auto-refresh timer, including the computed delay and emitted reload script.
-2. Add backend coverage proving repeated requests from the same source do not inflate the UTC-day unique counters.
-3. Tighten legacy database compatibility checks and add tests for subtly incompatible schemas that still have the right column names.
-4. Add more `GET /hi` validation-edge tests for overlong `agent`, overlong `message`, and blank-query normalization.
+1. Move production storage to managed Postgres (or equivalent) with parity schema/indexes and an explicit migration path from SQLite.
+2. Add explicit retention policy for `events` and supporting tables (time-based partitioning/deletion + operational guardrails).
+3. Harden abuse controls for real proxy deployments with a trusted-proxy validation strategy, anti-spoof stance, and tested Railway header configuration.
+4. Strengthen `/events` authentication beyond a single long-lived shared bearer token (rotation model, scoped credentials, and revocation playbook).
+5. Improve frontend/operator diagnostics so `/events` auth/config/rate-limit failures are surfaced distinctly instead of generic backend-unavailable copy.
+6. Align product documentation language (`context.md`) so `/events` auth is not in tension with the “Authentication” non-goal wording.
+7. Keep `SALT` and frontend-backend auth material strictly in platform secrets and enforce regular rotation.
+
+## Practical Next Steps (Fixes + Tests)
+
+1. Add a Postgres-backed integration test lane that validates migration parity for counters, unique-day logic, token flow, and `/events` query behavior.
+2. Add retention tests that verify TTL/partition pruning correctness and ensure stats/counters remain consistent after cleanup jobs.
+3. Add proxy hardening tests for trusted vs untrusted forwarding headers (including spoof attempts) and Railway-specific deployment checks.
+4. Add auth-hardening tests for rotated/revoked `/events` credentials and distinct 401/429 handling across backend and frontend UX.
+5. Add frontend coverage for auto-refresh timer behavior and improved operator-facing error messages by failure class.
+6. Add backend coverage proving repeated requests from the same source do not inflate UTC-day unique counters.
+7. Add browser-level end-to-end verification of the rendered dashboard flow.
+8. Expand `GET /hi` validation-edge tests for overlong query params and additional bad-type combinations.

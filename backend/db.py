@@ -10,6 +10,30 @@ ALLOWED_SOURCE_KINDS = {"none", "unknown", "manual", "agent"}
 ALLOWED_EVENT_TYPES = {"fetch", "hi_get", "hi_post"}
 EVENTS_REFRESH_CADENCE_SECONDS = 600
 TOKEN_TTL_SECONDS = 60
+FETCH_RATE_LIMIT_PER_MINUTE = 60
+FETCH_RATE_LIMIT_PER_HOUR = 600
+HI_GET_RATE_LIMIT_PER_MINUTE = 20
+HI_GET_RATE_LIMIT_PER_HOUR = 240
+HI_POST_RATE_LIMIT_PER_MINUTE = 3
+HI_POST_RATE_LIMIT_PER_HOUR = 20
+EVENTS_RATE_LIMIT_PER_MINUTE = 1500
+EVENTS_RATE_LIMIT_PER_HOUR = 20000
+REQUIRED_INDEX_NAMES = {
+    "idx_events_ts_desc",
+    "idx_events_event_id",
+    "idx_events_ip_event_ts",
+    "idx_events_source_id",
+    "idx_events_crawler_id",
+    "idx_hi_tokens_expires",
+}
+REQUIRED_INDEX_SQL_FRAGMENTS = {
+    "idx_events_ts_desc": "on events(ts desc)",
+    "idx_events_event_id": "on events(event_type, id desc)",
+    "idx_events_ip_event_ts": "on events(ip_hash, event_type, ts desc)",
+    "idx_events_source_id": "on events(source_kind, id desc)",
+    "idx_events_crawler_id": "on events(likely_crawler, id desc)",
+    "idx_hi_tokens_expires": "on hi_tokens(expires_at)",
+}
 CRAWLER_MARKERS = (
     "bot",
     "crawl",
@@ -24,7 +48,7 @@ CRAWLER_MARKERS = (
 
 
 class RateLimitExceeded(Exception):
-    """Raised when a client exceeds the hi POST write limits."""
+    """Raised when a client exceeds public write limits."""
 
 
 class SchemaCompatibilityError(RuntimeError):
@@ -75,10 +99,11 @@ def create_connection(database_path: str) -> sqlite3.Connection:
 def initialize_database(database_path: str) -> None:
     with create_connection(database_path) as connection:
         connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA busy_timeout=5000")
         _ensure_schema_compatible_or_empty(connection)
         _create_schema(connection)
+        _cleanup_expired_tokens(connection, utc_now())
         _ensure_cache_row(connection)
         rebuild_stats_cache(connection)
 
@@ -120,6 +145,45 @@ def build_request_context(request: Any, salt: str, trust_proxy_headers: bool) ->
     }
 
 
+def enforce_events_rate_limit(
+    database_path: str,
+    context: dict[str, Any],
+    *,
+    minute_limit: int | None = None,
+    hour_limit: int | None = None,
+) -> None:
+    resolved_minute_limit = EVENTS_RATE_LIMIT_PER_MINUTE if minute_limit is None else minute_limit
+    resolved_hour_limit = EVENTS_RATE_LIMIT_PER_HOUR if hour_limit is None else hour_limit
+
+    with create_connection(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _cleanup_endpoint_hits(connection, context["now"])
+
+            if _is_endpoint_rate_limited(
+                connection=connection,
+                endpoint="/events",
+                ip_hash=context["ip_hash"],
+                now=context["now"],
+                minute_limit=resolved_minute_limit,
+                hour_limit=resolved_hour_limit,
+            ):
+                connection.rollback()
+                raise RateLimitExceeded()
+
+            connection.execute(
+                """
+                INSERT INTO endpoint_hits (ts, endpoint, ip_hash)
+                VALUES (?, '/events', ?)
+                """,
+                (context["ts"], context["ip_hash"]),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
 def record_fetch(database_path: str, context: dict[str, Any]) -> None:
     record_fetch_and_issue_token(database_path, context)
 
@@ -136,6 +200,27 @@ def record_fetch_and_issue_token(
         try:
             connection.execute("BEGIN IMMEDIATE")
             _ensure_cache_window_current(connection, context["window_day"])
+            _cleanup_expired_tokens(connection, context["now"])
+
+            if _is_rate_limited(
+                connection=connection,
+                ip_hash=context["ip_hash"],
+                now=context["now"],
+                event_type="fetch",
+                minute_limit=FETCH_RATE_LIMIT_PER_MINUTE,
+                hour_limit=FETCH_RATE_LIMIT_PER_HOUR,
+            ):
+                connection.rollback()
+                raise RateLimitExceeded()
+
+            is_new_fetch_unique_utc_day = not _source_window_exists(
+                connection=connection,
+                window_day=context["window_day"],
+                event_type="fetch",
+                ip_hash=context["ip_hash"],
+                token_used=0,
+            )
+
             cursor = connection.execute(
                 """
                 INSERT INTO events (
@@ -187,7 +272,16 @@ def record_fetch_and_issue_token(
                 ip_hash=context["ip_hash"],
                 ts=context["ts"],
             )
-            rebuild_stats_cache(connection)
+            _apply_event_to_stats_cache(
+                connection=connection,
+                event_type="fetch",
+                source_kind="none",
+                token_used=0,
+                ts=context["ts"],
+                is_new_fetch_unique_utc_day=is_new_fetch_unique_utc_day,
+                is_new_hi_unique_utc_day=False,
+                is_new_hi_post_token_unique_utc_day=False,
+            )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -465,8 +559,26 @@ def _record_hi_event(
         try:
             connection.execute("BEGIN IMMEDIATE")
             _ensure_cache_window_current(connection, context["window_day"])
+            _cleanup_expired_tokens(connection, context["now"])
 
-            if event_type == "hi_post" and _is_rate_limited(connection, context["ip_hash"], context["now"]):
+            minute_limit = (
+                HI_POST_RATE_LIMIT_PER_MINUTE
+                if event_type == "hi_post"
+                else HI_GET_RATE_LIMIT_PER_MINUTE
+            )
+            hour_limit = (
+                HI_POST_RATE_LIMIT_PER_HOUR
+                if event_type == "hi_post"
+                else HI_GET_RATE_LIMIT_PER_HOUR
+            )
+            if _is_rate_limited(
+                connection=connection,
+                ip_hash=context["ip_hash"],
+                now=context["now"],
+                event_type=event_type,
+                minute_limit=minute_limit,
+                hour_limit=hour_limit,
+            ):
                 connection.rollback()
                 raise RateLimitExceeded()
 
@@ -477,6 +589,20 @@ def _record_hi_event(
                     current_time=context["now"],
                     used_at=context["ts"],
                 )
+
+            is_new_hi_unique_utc_day = not _has_hi_source_for_day(
+                connection=connection,
+                window_day=context["window_day"],
+                ip_hash=context["ip_hash"],
+            )
+            is_new_hi_post_token_unique_utc_day = (
+                token_used == 1
+                and not _has_hi_post_token_source_for_day(
+                    connection=connection,
+                    window_day=context["window_day"],
+                    ip_hash=context["ip_hash"],
+                )
+            )
 
             cursor = connection.execute(
                 """
@@ -515,7 +641,16 @@ def _record_hi_event(
                 ip_hash=context["ip_hash"],
                 ts=context["ts"],
             )
-            rebuild_stats_cache(connection)
+            _apply_event_to_stats_cache(
+                connection=connection,
+                event_type=event_type,
+                source_kind=source_kind,
+                token_used=token_used,
+                ts=context["ts"],
+                is_new_fetch_unique_utc_day=False,
+                is_new_hi_unique_utc_day=is_new_hi_unique_utc_day,
+                is_new_hi_post_token_unique_utc_day=is_new_hi_post_token_unique_utc_day,
+            )
             stats = _read_stats_row(connection)
             connection.commit()
         except InvalidTokenError:
@@ -625,6 +760,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS endpoint_hits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            ip_hash TEXT NOT NULL
+        )
+        """
+    )
 
     connection.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_desc ON events(ts DESC)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_events_event_id ON events(event_type, id DESC)")
@@ -639,6 +784,12 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_hi_tokens_expires ON hi_tokens(expires_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_endpoint_hits_endpoint_ip_ts ON endpoint_hits(endpoint, ip_hash, ts DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_source_windows_day_ip_event_token ON source_windows(window_day, ip_hash, event_type, token_used)"
     )
 
 
@@ -709,7 +860,216 @@ def _ensure_schema_compatible_or_empty(connection: sqlite3.Connection) -> None:
         rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         available = {row["name"] for row in rows}
         if not required.issubset(available):
-            raise SchemaCompatibilityError("incompatible database schema detected")
+            raise _schema_error(f"{table_name} missing required columns")
+
+    _validate_table_primary_key(connection, "events", ["id"])
+    _validate_table_primary_key(connection, "hi_tokens", ["token_hash"])
+    _validate_table_primary_key(
+        connection,
+        "source_windows",
+        ["window_day", "event_type", "source_kind", "token_used", "ip_hash"],
+    )
+    _validate_table_primary_key(connection, "stats_cache", ["cache_key"])
+
+    _validate_not_null_columns(
+        connection,
+        "events",
+        {
+            "ts",
+            "event_type",
+            "path",
+            "source_kind",
+            "user_agent",
+            "ip_hash",
+            "likely_crawler",
+            "token_used",
+        },
+    )
+    _validate_not_null_columns(
+        connection,
+        "hi_tokens",
+        {"token_hash", "issued_at", "expires_at", "fetch_event_id", "issued_ip_hash"},
+    )
+    _validate_not_null_columns(
+        connection,
+        "source_windows",
+        {
+            "window_day",
+            "event_type",
+            "source_kind",
+            "token_used",
+            "ip_hash",
+            "event_count",
+            "first_ts",
+            "last_ts",
+        },
+    )
+    _validate_not_null_columns(
+        connection,
+        "stats_cache",
+        {
+            "cache_key",
+            "cache_window_day",
+            "fetch_count",
+            "hi_get_count",
+            "hi_post_count",
+            "hi_post_token_count",
+            "hi_total_count",
+            "hi_unknown_count",
+            "hi_manual_count",
+            "fetch_unique_utc_day",
+            "hi_total_unique_utc_day",
+            "hi_post_token_unique_utc_day",
+            "updated_at",
+        },
+    )
+
+    _validate_check_fragment(
+        connection,
+        "events",
+        "check (event_type in ('fetch', 'hi_get', 'hi_post'))",
+    )
+    _validate_check_fragment(
+        connection,
+        "events",
+        "check (source_kind in ('none', 'unknown', 'manual', 'agent'))",
+    )
+    _validate_check_fragment(
+        connection,
+        "events",
+        "check (likely_crawler in (0, 1))",
+    )
+    _validate_check_fragment(
+        connection,
+        "events",
+        "check (token_used in (0, 1))",
+    )
+    _validate_check_fragment(
+        connection,
+        "source_windows",
+        "check (token_used in (0, 1))",
+    )
+
+    _validate_hi_tokens_foreign_key(connection)
+    _validate_required_indexes(connection)
+
+
+def _schema_error(reason: str) -> SchemaCompatibilityError:
+    return SchemaCompatibilityError(f"incompatible database schema detected: {reason}")
+
+
+def _validate_table_primary_key(
+    connection: sqlite3.Connection,
+    table_name: str,
+    expected_columns: list[str],
+) -> None:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    if not rows:
+        return
+
+    pk_rows = [row for row in rows if int(row["pk"]) > 0]
+    ordered_pk_columns = [
+        row["name"] for row in sorted(pk_rows, key=lambda item: int(item["pk"]))
+    ]
+    if ordered_pk_columns != expected_columns:
+        raise _schema_error(f"{table_name} primary key mismatch")
+
+
+def _validate_not_null_columns(
+    connection: sqlite3.Connection,
+    table_name: str,
+    required_not_null_columns: set[str],
+) -> None:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    if not rows:
+        return
+
+    nullable_required = [
+        row["name"]
+        for row in rows
+        if row["name"] in required_not_null_columns
+        and int(row["notnull"]) != 1
+        and int(row["pk"]) == 0
+    ]
+    if nullable_required:
+        raise _schema_error(
+            f"{table_name} allows NULL for required columns: {', '.join(sorted(nullable_required))}"
+        )
+
+
+def _normalized_create_sql(connection: sqlite3.Connection, table_name: str) -> str:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table_name,),
+    ).fetchone()
+    if row is None or not row["sql"]:
+        return ""
+    return _normalize_sql(str(row["sql"]))
+
+
+def _normalize_sql(value: str) -> str:
+    normalized = " ".join(value.strip().lower().split())
+    for ch in ('"', "`", "[", "]"):
+        normalized = normalized.replace(ch, "")
+    return normalized
+
+
+def _validate_check_fragment(connection: sqlite3.Connection, table_name: str, fragment: str) -> None:
+    normalized_sql = _normalized_create_sql(connection, table_name)
+    if not normalized_sql:
+        return
+    normalized_fragment = " ".join(fragment.strip().lower().split())
+    if normalized_fragment not in normalized_sql:
+        raise _schema_error(f"{table_name} missing required CHECK constraint")
+
+
+def _validate_hi_tokens_foreign_key(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("PRAGMA foreign_key_list(hi_tokens)").fetchall()
+    if not rows:
+        raise _schema_error("hi_tokens missing required foreign key")
+
+    has_required_fk = any(
+        row["table"] == "events" and row["from"] == "fetch_event_id" and row["to"] == "id"
+        for row in rows
+    )
+    if not has_required_fk:
+        raise _schema_error("hi_tokens foreign key mismatch")
+
+
+def _validate_required_indexes(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT name, tbl_name, sql
+        FROM sqlite_master
+        WHERE type = 'index'
+          AND name NOT LIKE 'sqlite_%'
+        """
+    ).fetchall()
+    by_name = {str(row["name"]): row for row in rows}
+    existing_names = set(by_name.keys())
+    missing = sorted(REQUIRED_INDEX_NAMES - existing_names)
+    if missing:
+        raise _schema_error(f"missing required indexes: {', '.join(missing)}")
+
+    mismatched: list[str] = []
+    for index_name, expected_fragment in REQUIRED_INDEX_SQL_FRAGMENTS.items():
+        row = by_name.get(index_name)
+        if row is None:
+            continue
+        sql_text = row["sql"]
+        if not sql_text:
+            mismatched.append(index_name)
+            continue
+        if _normalize_sql(expected_fragment) not in _normalize_sql(str(sql_text)):
+            mismatched.append(index_name)
+    if mismatched:
+        raise _schema_error(
+            f"required index definitions mismatch: {', '.join(sorted(mismatched))}"
+        )
 
 
 def _ensure_cache_row(connection: sqlite3.Connection) -> None:
@@ -796,7 +1156,135 @@ def _touch_source_window(
     )
 
 
-def _is_rate_limited(connection: sqlite3.Connection, ip_hash: str, now: datetime) -> bool:
+def _source_window_exists(
+    *,
+    connection: sqlite3.Connection,
+    window_day: str,
+    event_type: str,
+    ip_hash: str,
+    token_used: int | None = None,
+) -> bool:
+    conditions = ["window_day = ?", "event_type = ?", "ip_hash = ?"]
+    params: list[Any] = [window_day, event_type, ip_hash]
+    if token_used is not None:
+        conditions.append("token_used = ?")
+        params.append(token_used)
+
+    where_clause = " AND ".join(conditions)
+    row = connection.execute(
+        f"""
+        SELECT 1
+        FROM source_windows
+        WHERE {where_clause}
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    return row is not None
+
+
+def _has_hi_source_for_day(
+    *,
+    connection: sqlite3.Connection,
+    window_day: str,
+    ip_hash: str,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM source_windows
+        WHERE window_day = ?
+          AND ip_hash = ?
+          AND event_type IN ('hi_get', 'hi_post')
+        LIMIT 1
+        """,
+        (window_day, ip_hash),
+    ).fetchone()
+    return row is not None
+
+
+def _has_hi_post_token_source_for_day(
+    *,
+    connection: sqlite3.Connection,
+    window_day: str,
+    ip_hash: str,
+) -> bool:
+    return _source_window_exists(
+        connection=connection,
+        window_day=window_day,
+        event_type="hi_post",
+        ip_hash=ip_hash,
+        token_used=1,
+    )
+
+
+def _apply_event_to_stats_cache(
+    *,
+    connection: sqlite3.Connection,
+    event_type: str,
+    source_kind: str,
+    token_used: int,
+    ts: str,
+    is_new_fetch_unique_utc_day: bool,
+    is_new_hi_unique_utc_day: bool,
+    is_new_hi_post_token_unique_utc_day: bool,
+) -> None:
+    _read_stats_row(connection)
+
+    is_hi_event = event_type in {"hi_get", "hi_post"}
+    fetch_delta = 1 if event_type == "fetch" else 0
+    hi_get_delta = 1 if event_type == "hi_get" else 0
+    hi_post_delta = 1 if event_type == "hi_post" and token_used == 0 else 0
+    hi_post_token_delta = 1 if event_type == "hi_post" and token_used == 1 else 0
+    hi_total_delta = 1 if is_hi_event else 0
+    hi_unknown_delta = 1 if is_hi_event and source_kind == "unknown" else 0
+    hi_manual_delta = 1 if is_hi_event and source_kind == "manual" else 0
+    fetch_unique_delta = 1 if is_new_fetch_unique_utc_day else 0
+    hi_total_unique_delta = 1 if is_new_hi_unique_utc_day else 0
+    hi_post_token_unique_delta = 1 if is_new_hi_post_token_unique_utc_day else 0
+
+    connection.execute(
+        """
+        UPDATE stats_cache
+        SET
+            fetch_count = fetch_count + ?,
+            hi_get_count = hi_get_count + ?,
+            hi_post_count = hi_post_count + ?,
+            hi_post_token_count = hi_post_token_count + ?,
+            hi_total_count = hi_total_count + ?,
+            hi_unknown_count = hi_unknown_count + ?,
+            hi_manual_count = hi_manual_count + ?,
+            fetch_unique_utc_day = fetch_unique_utc_day + ?,
+            hi_total_unique_utc_day = hi_total_unique_utc_day + ?,
+            hi_post_token_unique_utc_day = hi_post_token_unique_utc_day + ?,
+            updated_at = ?
+        WHERE cache_key = 'global'
+        """,
+        (
+            fetch_delta,
+            hi_get_delta,
+            hi_post_delta,
+            hi_post_token_delta,
+            hi_total_delta,
+            hi_unknown_delta,
+            hi_manual_delta,
+            fetch_unique_delta,
+            hi_total_unique_delta,
+            hi_post_token_unique_delta,
+            ts,
+        ),
+    )
+
+
+def _is_rate_limited(
+    *,
+    connection: sqlite3.Connection,
+    ip_hash: str,
+    now: datetime,
+    event_type: str,
+    minute_limit: int,
+    hour_limit: int,
+) -> bool:
     minute_cutoff = utc_timestamp(now - timedelta(seconds=60))
     hour_cutoff = utc_timestamp(now - timedelta(seconds=3600))
 
@@ -804,22 +1292,56 @@ def _is_rate_limited(connection: sqlite3.Connection, ip_hash: str, now: datetime
         """
         SELECT COUNT(*) AS hit_count
         FROM events
-        WHERE event_type = 'hi_post' AND ip_hash = ? AND ts >= ?
+        WHERE event_type = ? AND ip_hash = ? AND ts >= ?
         """,
-        (ip_hash, minute_cutoff),
+        (event_type, ip_hash, minute_cutoff),
     ).fetchone()["hit_count"]
-    if minute_count >= 3:
+    if minute_count >= minute_limit:
         return True
 
     hour_count = connection.execute(
         """
         SELECT COUNT(*) AS hit_count
         FROM events
-        WHERE event_type = 'hi_post' AND ip_hash = ? AND ts >= ?
+        WHERE event_type = ? AND ip_hash = ? AND ts >= ?
         """,
-        (ip_hash, hour_cutoff),
+        (event_type, ip_hash, hour_cutoff),
     ).fetchone()["hit_count"]
-    return hour_count >= 20
+    return hour_count >= hour_limit
+
+
+def _is_endpoint_rate_limited(
+    *,
+    connection: sqlite3.Connection,
+    endpoint: str,
+    ip_hash: str,
+    now: datetime,
+    minute_limit: int,
+    hour_limit: int,
+) -> bool:
+    minute_cutoff = utc_timestamp(now - timedelta(seconds=60))
+    hour_cutoff = utc_timestamp(now - timedelta(seconds=3600))
+
+    minute_count = connection.execute(
+        """
+        SELECT COUNT(*) AS hit_count
+        FROM endpoint_hits
+        WHERE endpoint = ? AND ip_hash = ? AND ts >= ?
+        """,
+        (endpoint, ip_hash, minute_cutoff),
+    ).fetchone()["hit_count"]
+    if minute_count >= minute_limit:
+        return True
+
+    hour_count = connection.execute(
+        """
+        SELECT COUNT(*) AS hit_count
+        FROM endpoint_hits
+        WHERE endpoint = ? AND ip_hash = ? AND ts >= ?
+        """,
+        (endpoint, ip_hash, hour_cutoff),
+    ).fetchone()["hit_count"]
+    return hour_count >= hour_limit
 
 
 def _validate_and_consume_token(
@@ -853,6 +1375,16 @@ def _validate_and_consume_token(
         """,
         (used_at, token_hash),
     )
+
+
+def _cleanup_expired_tokens(connection: sqlite3.Connection, now: datetime) -> None:
+    cutoff_ts = utc_timestamp(now)
+    connection.execute("DELETE FROM hi_tokens WHERE expires_at <= ?", (cutoff_ts,))
+
+
+def _cleanup_endpoint_hits(connection: sqlite3.Connection, now: datetime) -> None:
+    cutoff_ts = utc_timestamp(now - timedelta(seconds=3600))
+    connection.execute("DELETE FROM endpoint_hits WHERE ts < ?", (cutoff_ts,))
 
 
 def _rebuild_source_windows_for_day(connection: sqlite3.Connection, window_day: str) -> None:
@@ -960,4 +1492,3 @@ def _generate_token() -> str:
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-

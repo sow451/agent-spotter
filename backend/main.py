@@ -27,6 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LLMS_PATH = PROJECT_ROOT / "llms.txt"
 AI_RECIPE_PATH = PROJECT_ROOT / "ai" / "recipe.md"
 RECIPE_PATH = PROJECT_ROOT / "recipe.md"
+CANARY_RECIPE_PATH = PROJECT_ROOT / "banana-muffins.md"
 EVENTS_AUTH_SCHEME = "bearer"
 DEFAULT_DATABASE_PATH = "events.db"
 MANAGED_RUNTIME_MARKERS = {
@@ -68,12 +69,46 @@ def create_app() -> FastAPI:
         return JSONResponse({"status": "ok"})
 
     @app.get("/llms.txt")
-    async def get_llms_txt() -> PlainTextResponse:
+    async def get_llms_txt(request: Request) -> PlainTextResponse:
+        context = db.build_request_context(
+            request=request,
+            salt=app.state.salt,
+            trust_proxy_headers=app.state.trust_proxy_headers,
+        )
+        _record_resource_read(
+            database_path=app.state.database_path,
+            context=context,
+            path="/llms.txt",
+        )
         return PlainTextResponse(_read_text_file(LLMS_PATH), media_type="text/plain")
 
     @app.get("/ai/recipe.md")
-    async def get_ai_recipe() -> PlainTextResponse:
+    async def get_ai_recipe(request: Request) -> PlainTextResponse:
+        context = db.build_request_context(
+            request=request,
+            salt=app.state.salt,
+            trust_proxy_headers=app.state.trust_proxy_headers,
+        )
+        _record_resource_read(
+            database_path=app.state.database_path,
+            context=context,
+            path="/ai/recipe.md",
+        )
         return PlainTextResponse(_read_text_file(AI_RECIPE_PATH), media_type="text/markdown")
+
+    @app.get("/banana-muffins.md")
+    async def get_canary_recipe(request: Request) -> PlainTextResponse:
+        context = db.build_request_context(
+            request=request,
+            salt=app.state.salt,
+            trust_proxy_headers=app.state.trust_proxy_headers,
+        )
+        _record_resource_read(
+            database_path=app.state.database_path,
+            context=context,
+            path="/banana-muffins.md",
+        )
+        return PlainTextResponse(_read_text_file(CANARY_RECIPE_PATH), media_type="text/markdown")
 
     @app.get("/hi")
     async def get_hi(
@@ -364,6 +399,14 @@ def _record_fetch_response(database_path: str, context: dict[str, Any]) -> str:
         context=context,
     )
     return _coerce_agent_txt_response(result)
+
+
+def _record_resource_read(*, database_path: str, context: dict[str, Any], path: str) -> None:
+    db.record_resource_access(
+        database_path=database_path,
+        context=context,
+        path=path,
+    )
 
 
 def _record_hi_get(

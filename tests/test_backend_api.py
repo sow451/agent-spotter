@@ -43,11 +43,15 @@ def _create_compatible_schema(
     connection: sqlite3.Connection,
     *,
     include_event_type_check: bool = True,
+    include_resource_event_type: bool = True,
     include_hi_tokens_foreign_key: bool = True,
     include_required_indexes: bool = True,
 ) -> None:
+    event_type_values = "'fetch', 'hi_get', 'hi_post', 'resource'"
+    if not include_resource_event_type:
+        event_type_values = "'fetch', 'hi_get', 'hi_post'"
     event_type_column = (
-        "event_type TEXT NOT NULL CHECK (event_type IN ('fetch', 'hi_get', 'hi_post'))"
+        f"event_type TEXT NOT NULL CHECK (event_type IN ({event_type_values}))"
         if include_event_type_check
         else "event_type TEXT NOT NULL"
     )
@@ -226,9 +230,12 @@ def test_trust_proxy_headers_uses_forwarded_ip_for_ip_hash(database_path, monkey
     assert row["ip_hash"] == db.hash_ip("203.0.113.5", "test-salt")
 
 
-def test_llms_and_ai_recipe_routes_serve_invitation_files(client) -> None:
-    llms_response = client.get("/llms.txt")
-    ai_recipe_response = client.get("/ai/recipe.md")
+def test_llms_and_ai_recipe_routes_serve_invitation_files_and_log_resource_reads(
+    client,
+    db_connection,
+) -> None:
+    llms_response = client.get("/llms.txt", headers={"User-Agent": "AgentReader/1.0"})
+    ai_recipe_response = client.get("/ai/recipe.md", headers={"User-Agent": "AgentReader/2.0"})
 
     assert llms_response.status_code == 200
     assert llms_response.headers["content-type"].startswith("text/plain")
@@ -243,6 +250,43 @@ def test_llms_and_ai_recipe_routes_serve_invitation_files(client) -> None:
         "`GET https://agentspotter-backend-production.up.railway.app/agent.txt`"
         in ai_recipe_response.text
     )
+
+    rows = db_connection.execute(
+        """
+        SELECT event_type, path, user_agent, source_kind, token_used
+        FROM events
+        ORDER BY id ASC
+        """
+    ).fetchall()
+
+    assert [row["event_type"] for row in rows] == ["resource", "resource"]
+    assert [row["path"] for row in rows] == ["/llms.txt", "/ai/recipe.md"]
+    assert [row["user_agent"] for row in rows] == ["AgentReader/1.0", "AgentReader/2.0"]
+    assert all(row["source_kind"] == "none" for row in rows)
+    assert all(row["token_used"] == 0 for row in rows)
+
+
+def test_canary_recipe_route_serves_markdown_and_logs_resource_read(client, db_connection) -> None:
+    response = client.get("/banana-muffins.md", headers={"User-Agent": "CanaryBot/1.0"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/markdown")
+    assert "# Banana Muffin Recipe for High Altitude" in response.text
+    assert "https://agentspotter-backend-production.up.railway.app/hi" in response.text
+
+    row = db_connection.execute(
+        """
+        SELECT event_type, path, user_agent, source_kind, token_used
+        FROM events
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row["event_type"] == "resource"
+    assert row["path"] == "/banana-muffins.md"
+    assert row["user_agent"] == "CanaryBot/1.0"
+    assert row["source_kind"] == "none"
+    assert row["token_used"] == 0
 
 
 def test_get_hi_applies_defaults_and_logs_hi_get(client, db_connection) -> None:
@@ -967,6 +1011,40 @@ def test_startup_rejects_schema_with_missing_event_type_check(database_path, mon
 
     with pytest.raises(db.SchemaCompatibilityError, match="CHECK constraint"):
         create_app()
+
+
+def test_legacy_event_type_check_uses_fallback_table_for_resource_reads(
+    database_path,
+    monkeypatch,
+) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    with sqlite3.connect(database_path) as connection:
+        _create_compatible_schema(connection, include_resource_event_type=False)
+        connection.commit()
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        response = client.get("/llms.txt", headers={"User-Agent": "LegacyAgent/1.0"})
+
+    assert response.status_code == 200
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        resource_event_count = connection.execute(
+            "SELECT COUNT(*) AS hit_count FROM events WHERE event_type = 'resource'"
+        ).fetchone()["hit_count"]
+        fallback_row = connection.execute(
+            """
+            SELECT path, user_agent, likely_crawler
+            FROM resource_reads
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    assert resource_event_count == 0
+    assert fallback_row["path"] == "/llms.txt"
+    assert fallback_row["user_agent"] == "LegacyAgent/1.0"
+    assert fallback_row["likely_crawler"] == 0
 
 
 def test_get_events_validates_filters_and_preserves_fetch_rows_when_source_filtered(client) -> None:

@@ -114,7 +114,7 @@ def test_frontend_runs_with_real_streamlit_testing_and_handles_backend_failure(m
         "Could not load backend data: "
         "Live event data is unavailable right now. Check the backend and try again."
     )
-    assert len(app_test.metric) >= 4
+    assert len(app_test.markdown) > 0
 
 
 def test_frontend_main_bootstraps_with_fake_streamlit(monkeypatch) -> None:
@@ -135,7 +135,7 @@ def test_frontend_main_bootstraps_with_fake_streamlit(monkeypatch) -> None:
         call_order.append(("controls", None))
         return (
             {
-                "route": "All routes",
+                "route": "All activity",
                 "type": "all",
                 "source": "all",
                 "hide_likely_crawlers": False,
@@ -189,7 +189,7 @@ def test_frontend_main_bootstraps_with_fake_streamlit(monkeypatch) -> None:
         }
     ]
     assert any("agent-spotter" in body for body, _ in fake_st.markdown_calls)
-    assert fake_st.session_state["ui_route_filter"] == "All routes"
+    assert fake_st.session_state["ui_route_filter"] == "All activity"
     assert fake_st.session_state["ui_sort_order"] == "Newest to Oldest"
     assert fake_st.session_state["ui_event_type"] == "all"
     assert fake_st.session_state["ui_limit"] == 50
@@ -328,9 +328,41 @@ def test_render_sidebar_mentions_path_specific_reward_and_limitations(monkeypatc
     write_text = " ".join(str(body) for body in fake_st.write_calls)
 
     assert "https://backend.example/llms.txt" in markdown_text
+    assert "https://agentspotter-backend-production.up.railway.app/banana-muffins.md" in markdown_text
+    assert "`resource` = someone opened one of the markdown recipe files" in markdown_text
     assert "your place among callers who used that same response path" in markdown_text
     assert "`hi_post_token`" in markdown_text
     assert "A hi response does not prove that the caller is an AI system" in write_text
+
+
+def test_current_filters_maps_resource_reads_to_all_type(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app._init_state()
+    fake_st.session_state["ui_route_filter"] = "Resource reads"
+
+    filters = app._current_filters()
+
+    assert filters["route"] == "Scraped recipe.md (read)"
+    assert filters["type"] == "all"
+
+
+def test_apply_feed_view_filters_resource_reads_route() -> None:
+    app = importlib.import_module("frontend.app")
+    events = [
+        {"id": 1, "ts": "2026-03-04T00:00:00.000Z", "event_type": "resource", "path": "/llms.txt"},
+        {"id": 2, "ts": "2026-03-04T00:01:00.000Z", "event_type": "fetch", "path": "/agent.txt"},
+        {"id": 3, "ts": "2026-03-04T00:02:00.000Z", "event_type": "hi_get", "path": "/hi"},
+    ]
+    filtered = app._apply_feed_view(
+        events,
+        {"route": "Resource reads", "sort_order": "Newest to Oldest"},
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0]["event_type"] == "resource"
+    assert filtered[0]["path"] == "/llms.txt"
 
 
 def test_display_message_masks_profanity_but_keeps_clean_text() -> None:
@@ -507,7 +539,7 @@ def test_main_renders_refresh_caption_after_sync_populates_metadata(monkeypatch)
     def record_controls():
         return (
             {
-                "route": "All routes",
+                "route": "All activity",
                 "type": "all",
                 "source": "all",
                 "hide_likely_crawlers": False,
@@ -616,13 +648,14 @@ def test_analysis_snapshot_distinguishes_fetch_get_post_and_token_backed_post() 
     assert snapshot["sample_unknown_hi"] == 1
 
 
-def test_render_signal_board_uses_explicit_counter_labels(monkeypatch) -> None:
+def test_render_signal_board_uses_two_four_card_rows(monkeypatch) -> None:
     app = importlib.import_module("frontend.app")
     fake_st = _FakeStreamlit()
     monkeypatch.setattr(app, "st", fake_st)
 
     app._render_signal_board(
         {
+            "resource": 9,
             "fetch": 7,
             "hi_get": 2,
             "hi_post": 2,
@@ -639,15 +672,21 @@ def test_render_signal_board_uses_explicit_counter_labels(monkeypatch) -> None:
         }
     )
 
-    labels = [label for label, _value, _delta in fake_st.metric_calls]
+    markup = " ".join(body for body, _unsafe in fake_st.markdown_calls)
 
-    assert "Fetch" in labels
-    assert "GET /hi" in labels
-    assert "POST /hi" in labels
-    assert "POST /hi + token" in labels
-    assert "Fetch/Hi_total" in labels
+    assert "Row 1" in markup
+    assert "Scraped recipe" in markup
+    assert "Called /fetch for recipe" in markup
+    assert "Said hi" in markup
+    assert "Ratio: scraped / said hi" in markup
+    assert "Hi Details" in markup
+    assert "Lazy hi (GET /hi)" in markup
+    assert "Serious hi (POST /hi)" in markup
+    assert "V serious hi (POST /hi + token)" in markup
+    assert "Ratio: GET /hi / POST /hi" in markup
     assert any(
-        "higher-confidence follow-through, not verified identity" in body
+        "All traffic so far. These counters are not affected by the feed filters below."
+        in body
         for body in fake_st.caption_calls
     )
 
@@ -802,8 +841,10 @@ def test_render_event_feed_masks_profane_messages_and_keeps_plain_text_rows(monk
     assert hide_index is True
     assert width == "stretch"
     assert rows[0]["Name"] == "<b>agent</b>"
+    assert rows[0]["Path"] == "-"
     assert rows[0]["Message"] == "****"
     assert rows[1]["Name"] == "Viewer"
+    assert rows[1]["Path"] == "-"
     assert rows[1]["Message"] == "<script>alert(1)</script>"
     assert "<b>agent</b>" not in markdown_text
     assert "<script>alert(1)</script>" not in markdown_text

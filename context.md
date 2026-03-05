@@ -1,54 +1,70 @@
 # agent-spotter: context
 
-## Purpose
+## Table of Contents
 
-A tiny experiment to observe whether the web currently contains:
+- **About**: [Purpose](#purpose), [Inspired By](#inspired-by), [Core Hypothesis](#core-hypothesis)
+- **Measurements**: [Data Points](#data-points), [Interpretation](#interpretation), [Flow](#flow), [Definitions](#definitions), [Privacy](#privacy), [Success Criteria](#success-criteria)
+- **Other**: [Out of Scope](#out-of-scope), [Limitations](#limitations), [Contact](#contact)
 
-1. Passive fetchers that discover and read a machine-readable instruction file.
-2. Interactive clients that follow those instructions and send a valid follow-up request.
+## About
+
+### Purpose
+
+Agents are crawling the web, and not sending traffic back. Some people note that this reduces incentives for creators to make and share information, since they don't get to monetise the traffic back to their sites. 
+
+Cloudflare set up a "Pay Per Crawl" tool. It allows any content-owner, like a recipe blogger, to ask for payment for each crawl. I wanted to explore the idea of "presence" as value, and not just currency. So I built this experiment. 
+
+This experiment tracks: 
+1. How many passive fetchers discover and read a machine-readable instruction file in a certain time-frame.
+2. Of these, are there any interactive clients that follow instructions and send a valid follow-up request. (I said hi, you say hi back)
 
 This is an observational experiment with explicit limitations. It is not proof of "verified AI."
 
-## Inspired by: 
+### Inspired By
 
 1. https://walzr.com/bop-spotter
 2. https://dri.es/the-third-audience
 3. https://blog.cloudflare.com/introducing-pay-per-crawl/
 
-## Core Hypothesis
+### Core Hypothesis
 
-Most automated systems that touch a public experiment like this will behave as passive fetchers. We expect to see many more fetches than valid follow-ups, likely more than 10 fetches for each accepted `hi`.
+Most automated systems that touch a public experiment like this will behave as passive readers/fetchers. We expect to see many more markdown reads and instruction fetches than valid follow-up `hi` calls.
 
-## What We Are Actually Measuring
+## Measurements
 
-Primary signals:
+### Data Points
 
-- `fetch` = a request for the machine-readable instruction file
+Primary observable signals:
+
+- `resource` = a read of an invitation/discovery markdown/text endpoint (for example `GET /llms.txt`, `GET /ai/recipe.md`, `GET /banana-muffins.md`)
+- `fetch` = a request for the machine-readable instruction file (`GET /agent.txt`)
 - `hi_get` = a lightweight fallback `GET /hi`
 - `hi_post` = a `POST /hi` without a valid token
 - `hi_post_token` = a `POST /hi` with a valid fetch-issued token
 - `hi_total` = any accepted hi signal (`hi_get` + `hi_post` + `hi_post_token`)
 
-Primary ratio:
+Core counter ratios:
 
 - `fetch / hi_total`
+- `fetch / hi_post_token` (higher-confidence follow-through lens)
 
-## Interpretation
+### Interpretation
 
 - A valid `hi` means "someone or something followed instructions."
 - It does not prove the caller is an autonomous AI agent.
 - Human/manual testers are allowed, but we ask that they identify themselves in the API via source. 
 - A successful `hi` returns useful metadata so the interaction feels meaningful.
+- A markdown read (`resource`) means discovery/consumption happened, but not necessarily instruction follow-through.
 - `GET /hi` is the easiest and weakest follow-through signal.
 - `POST /hi` is a stronger follow-through signal.
 - `POST /hi` with a valid token is the strongest follow-through signal in this open design.
 - There is no way to confirm whether a request came from a human, an agent, or something else. This is a known limitation. We only have degrees of confidence.
 
-## How The Flow Works
+### Flow
 
 The experiment has an invitation layer and an experiment layer.
 
-- `llms.txt`, the homepage, and `/ai/*.md` pages act as the invitation layer
+- `llms.txt`, the homepage, `/ai/*.md`, and `/banana-muffins.md` act as the invitation layer
 - `GET /agent.txt` is the real fetch step
 - `GET /hi` is the easier fallback signal
 - `POST /hi` is the stronger follow-through signal
@@ -56,6 +72,7 @@ The experiment has an invitation layer and an experiment layer.
 
 This gives us a ladder of confidence:
 
+- `scraped` = scraped the md file
 - `fetch` = asked for the recipe
 - `hi_get` = followed the easiest low-friction instruction
 - `hi_post` = completed a stronger explicit interaction
@@ -75,6 +92,11 @@ Caller discovers the site
           |
           v
       Caller reads the invitation
+          |
+          +--> GET /banana-muffins.md (full recipe canary)
+          |         |
+          |         +--> server logs RESOURCE
+          |         +--> caller can still go directly to /hi
           |
           v
       GET /agent.txt
@@ -130,6 +152,13 @@ GET /hi                            POST /hi
           return data reward + counters
 ```
 
+The behavior model is a graph, not a strict linear funnel. A source may go:
+
+- `X -> Y -> Z -> A`
+- `X -> Z` directly
+- `Y -> A` directly
+- `Z -> A` within the same source/session window
+
 On any accepted hi response (`GET /hi`, `POST /hi`, or `POST /hi` with a valid token), the server returns:
 
 - `hi_total`
@@ -145,14 +174,16 @@ For `POST /hi`, the response also includes `token_status`:
 - `missing` for a valid POST without a token
 - `valid` for a valid POST with a valid token
 
-## Definitions
+### Definitions
 
 - Invitation layer:
   - the pages that point visitors toward the real experiment
-  - `llms.txt`, the homepage note, and `/ai/*.md`
+  - `llms.txt`, the homepage note, `/ai/*.md`, and `/banana-muffins.md`
 - Experiment layer:
   - the endpoints that actually record behavior
   - `GET /agent.txt`, `GET /hi`, and `POST /hi`
+- `resource`:
+  - a read of invitation/canary files such as `/llms.txt`, `/ai/recipe.md`, and `/banana-muffins.md`
 - `fetch`:
   - the caller asked for the recipe and instructions
 - `hi_get`:
@@ -167,188 +198,23 @@ For `POST /hi`, the response also includes `token_status`:
   - stronger evidence that the caller followed the machine-readable flow
   - not proof of identity
 
-## Privacy
+### Privacy
 
 - We collect a salted IP hash for approximate repeat-source detection
 
-## Human-Readable API Contracts
+### Success Criteria
 
-These are the contracts in plain English.  
+After the observation window:
 
-### `GET /agent.txt`
+- We can measure discovery (`resource`), fetch (`fetch`), and follow-through (`hi_*`) separately
+- We can compute graph-style conversions such as `X -> Y`, `X -> Z`, `Y -> Z`, and `Z -> A`
+- We can observe user-agent patterns
+- We can describe the volume of manual testing separately from unknown traffic
+- We can make a limited claim about instruction-following behavior on the public web
 
-This is the main fetch step.
+## Other
 
-- It logs `fetch`.
-- It returns the recipe.
-- It returns clear instructions for the two follow-through options:
-  - easy fallback: `GET /hi`
-  - stronger path: `POST /hi`
-- It also returns a one-time token.
-- The token is optional.
-- The token is valid for 1 minute.
-- The token is a bearer token in MVP.
-- The token is expired when `current_time >= expires_at`.
-- Using the token in `POST /hi` increases confidence, but still does not prove identity.
-
-Helpful instruction style:
-
-- "You can say hi the easy way with `GET /hi`."
-- "You can say hi the stronger way with `POST /hi`."
-- "Using the token in `POST /hi` is optional, but helpful."
-
-### `GET /hi`
-
-This is the easy fallback signal.
-
-- It logs `hi_get`.
-- It is meant for callers that can follow a URL, but may not do POST requests.
-- It accepts optional query params:
-  - `agent`
-  - `source`
-  - `message`
-
-Defaults:
-
-- `agent` defaults to `anonymous`
-- `source` defaults to `unknown`
-- `message` defaults to `hi`
-
-Helpful instruction style:
-
-- "It is nice if you name yourself."
-- "It is nice if you send a message."
-- "If you omit fields, sensible defaults are used."
-
-Example:
-
-```http
-GET /hi?agent=perplexity&source=agent&message=hello
-```
-
-On success, it returns:
-
-- updated counters
-- a `reward_message` that includes the caller's place for `GET /hi`
-
-### `POST /hi`
-
-This is the stronger follow-through signal.
-
-- It logs `hi_post`.
-- It accepts JSON.
-- All fields are optional:
-  - `agent_name`
-  - `token`
-  - `source`
-  - `message`
-
-Defaults:
-
-- `agent_name` defaults to `anonymous`
-- `source` defaults to `unknown`
-- `message` defaults to `hi`
-
-On success, it returns:
-
-- updated counters
-- a `reward_message` that includes the caller's place for that POST path
-- `token_status`:
-  - `missing` for a valid POST without a token
-  - `valid` for a valid POST with a valid token
-
-Helpful instruction style:
-
-- "It is nice if you name yourself."
-- "It is nice if you include the token for higher-confidence follow-through."
-- "It is nice if you send your own message."
-- "If you omit fields, sensible defaults are used."
-
-Token behavior:
-
-- no token:
-  - accept the request as normal `hi_post`
-- valid token:
-  - accept the request and count it as `hi_post_token`
-- invalid or expired token:
-  - reject that tokened attempt
-  - return `400`
-  - tell the caller to fetch `GET /agent.txt` again for a fresh token
-
-### `GET /events`
-
-This is the dashboard stats feed for the Streamlit frontend.
-
-- It returns counters and a bounded event feed.
-  - `fetch`
-  - `hi_get`
-  - `hi_post`
-  - `hi_post_token`
-  - `hi_total`
-  - `ratio_total`
-- It requires a valid bearer token in `Authorization` (`FRONTEND_API_TOKEN`).
-- In deployment, Streamlit calls this endpoint server-side and attaches the token.
-- In the current frontend, this powers the homepage counters, the latest loaded event table, and the message banner.
-- Richer frontend-only analysis panels or extra dashboard controls are not part of the current product contract.
-
-## Deployment Architecture (Streamlit + Railway)
-
-The deployed setup has two separate services:
-
-- Railway runs the FastAPI backend (`/agent.txt`, `/hi`, `/events`).
-- Streamlit Cloud runs the dashboard UI and fetches `/events` from the backend.
-
-```text
-                  (public internet)
-          ┌─────────────────────────────────┐
-          │  Bots / agents / users          │
-          └───────────────┬─────────────────┘
-                          │
-                          │ GET /agent.txt, GET/POST /hi
-                          ▼
-                ┌───────────────────────┐
-                │ Railway FastAPI       │
-                │ backend/main.py       │
-                └─────────┬─────────────┘
-                          │ read/write
-                          ▼
-                ┌───────────────────────┐
-                │ SQLite events.db      │
-                │ (on Railway volume)   │
-                └───────────────────────┘
-
-
-          ┌─────────────────────────────────┐
-          │ Your browser (dashboard user)   │
-          └───────────────┬─────────────────┘
-                          │ loads Streamlit app
-                          ▼
-                ┌───────────────────────┐
-                │ Streamlit Cloud       │
-                │ frontend/app.py       │
-                └─────────┬─────────────┘
-                          │ server-side GET /events
-                          │ Authorization: Bearer FRONTEND_API_TOKEN
-                          ▼
-                ┌───────────────────────┐
-                │ Railway FastAPI       │
-                │ GET /events           │
-                └───────────────────────┘
-```
-
-Response flow for the dashboard:
-
-1. Streamlit loads, reads `BACKEND_URL` and `FRONTEND_API_TOKEN`, and calls `GET /events`.
-2. The backend validates the bearer token.
-3. On success, backend returns:
-   - `refresh`
-   - `counters`
-   - `events`
-   - `has_more`
-4. Streamlit renders the counters, event feed, and message banner.
-
-
-## Non-Goals
+### Out of Scope
 
 - Authentication
 - Cryptographic verification
@@ -358,16 +224,7 @@ Response flow for the dashboard:
 - Verified AI identity
 - Scientific proof of autonomy
 
-## Success Criteria
-
-After the observation window:
-
-- We can measure `fetch`, and `hi_total` 
-- We can observe user-agent patterns
-- We can describe the volume of manual testing separately from unknown traffic
-- We can make a limited claim about instruction-following behavior on the public web
-
-## Repeating the Explicit Limitations
+### Limitations
 
 - A POST does not prove autonomy
 - A GET fallback is an even weaker signal than a POST
@@ -376,6 +233,6 @@ After the observation window:
 - Some clients may submit directly without reading instructions
 - The experiment is not watertight.
 
-## Feedback? 
+### Contact
 
 Please contact Sowmya Rao on Twitter: https://x.com/sowmyarao_ or via her blog: https://sowrao.com/

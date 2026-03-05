@@ -10,6 +10,7 @@ The experiment now uses a combined flow:
   - `/llms.txt`
   - homepage note
   - `/ai/*.md`
+  - `/banana-muffins.md`
 - experiment layer:
   - `GET /agent.txt`
   - `GET /hi`
@@ -17,6 +18,7 @@ The experiment now uses a combined flow:
 
 This creates a signal ladder:
 
+- `resource`
 - `fetch`
 - `hi_get`
 - `hi_post`
@@ -24,6 +26,7 @@ This creates a signal ladder:
 
 Where:
 
+- `resource` is discovery/consumption of invitation or canary markdown/text resources
 - `hi_get` is the weakest follow-through signal
 - `hi_post` is a successful `POST /hi` without a valid token
 - `hi_post_token` is the strongest signal in this open design
@@ -77,7 +80,20 @@ agentspotter/
 - `BACKEND_URL` (required)
 - `FRONTEND_API_TOKEN` (required to fetch `GET /events`; may come from env var or Streamlit secrets)
 
-## Deployment Topology (Railway + Streamlit)
+## Detailed Contracts and Deployment
+
+This section centralizes the implementation-level behavior that was removed from `context.md`.
+See the detailed sections below in this document:
+
+- `Human-Readable API Contracts`
+- `Invitation/Canary Resource Endpoints`
+- `GET /agent.txt`
+- `GET /hi`
+- `POST /hi`
+- `GET /events`
+- `Deployment Architecture (Streamlit + Railway)`
+
+## Deployment Architecture (Streamlit + Railway)
 
 Production deploy uses two services:
 
@@ -87,6 +103,7 @@ Production deploy uses two services:
 ```text
                 Public callers (agents / users)
                            |
+                           | GET /llms.txt, GET /ai/recipe.md, GET /banana-muffins.md,
                            | GET /agent.txt, GET/POST /hi
                            v
                  Railway FastAPI backend
@@ -131,6 +148,7 @@ Operational config locations:
    - required PK shape
    - required `NOT NULL` columns
    - critical `CHECK` constraints
+   - for `events.event_type`, accept either legacy (`fetch`, `hi_get`, `hi_post`) or expanded (`fetch`, `hi_get`, `hi_post`, `resource`) enum checks
    - required `hi_tokens(fetch_event_id) -> events(id)` FK
    - required index presence + definitions
 5. Apply SQLite PRAGMAs:
@@ -147,7 +165,7 @@ Operational config locations:
 
 Purpose:
 
-- store raw experiment events
+- store raw invitation, fetch, and follow-through events
 
 Columns:
 
@@ -165,6 +183,7 @@ Columns:
 
 Allowed `event_type` values:
 
+- `resource`
 - `fetch`
 - `hi_get`
 - `hi_post`
@@ -178,10 +197,33 @@ Allowed `source_kind` values:
 
 Rules:
 
+- `resource` rows must use `source_kind = 'none'`
+- `resource` rows must use `token_used = 0`
 - `fetch` rows must use `source_kind = 'none'`
 - `fetch` rows must use `token_used = 0`
 - `hi_get` rows must use `token_used = 0`
 - `hi_post` rows may use `token_used = 0` or `1`
+
+## Table: `resource_reads`
+
+Purpose:
+
+- compatibility fallback table for logging resource reads when attached to a legacy `events` table that does not allow `event_type = 'resource'`
+
+Columns:
+
+- `id`
+- `ts`
+- `path`
+- `user_agent`
+- `ip_hash`
+- `likely_crawler`
+
+Rules:
+
+- this table is append-only fallback data
+- preferred write target is `events(event_type='resource')`
+- fallback writes only occur when `events` rejects `resource` due legacy `CHECK` constraints
 
 ## Table: `hi_tokens`
 
@@ -299,6 +341,7 @@ Create these indexes:
 - `events(source_kind, id DESC)`
 - `events(likely_crawler, id DESC)`
 - `hi_tokens(expires_at)`
+- `resource_reads(path, id DESC)`
 
 ## Request Normalization
 
@@ -325,9 +368,28 @@ Rule:
 
 - `likely_crawler` is a filter label only
 
-## API Contracts
+## Human-Readable API Contracts
 
 All endpoint paths in this section refer to the canonical backend origin. If frontend and backend are deployed as separate services, the frontend is a UI only and must link or call the backend by its configured origin.
+
+## Invitation/Canary Resource Endpoints
+
+### Purpose
+
+- expose machine-readable discovery documents
+- log invitation/canary reads as `resource`
+
+### Endpoints
+
+- `GET /llms.txt`
+- `GET /ai/recipe.md`
+- `GET /banana-muffins.md`
+
+### Behavior
+
+- each request logs one `resource` event in `events` when supported
+- if a legacy schema rejects `event_type='resource'`, write to `resource_reads` fallback table
+- `/banana-muffins.md` serves the full markdown recipe and includes optional action URLs (`/agent.txt`, `/hi`)
 
 ## `GET /agent.txt`
 
@@ -690,6 +752,7 @@ Rules:
 - `hi_total = hi_get + hi_post + hi_post_token`
 - `has_more` is `true` when the current page is full and older matching rows may still exist
 - `GET /events` may trigger a cache-window refresh on first read after a UTC day rollover so the public counters stay current
+- aggregate counters intentionally remain focused on `fetch` and `hi` families
 
 ### Event row response shape
 
@@ -710,6 +773,23 @@ Each `events` row must be:
 }
 ```
 
+Resource-row example:
+
+```json
+{
+  "id": 0,
+  "ts": "2026-03-04T12:34:56.789Z",
+  "event_type": "resource",
+  "path": "/banana-muffins.md",
+  "agent_name": null,
+  "message": null,
+  "source_kind": "none",
+  "user_agent": "ExampleBot/1.0",
+  "likely_crawler": true,
+  "token_used": false
+}
+```
+
 Never expose:
 
 - `ip_hash`
@@ -724,7 +804,8 @@ Never expose:
 - if `type=fetch`, include only `fetch`
 - if `type=hi`, include only `hi_get` and `hi_post` rows, including token-backed `hi_post` rows where `token_used = true`
 - `source` filtering only applies to hi rows
-- if `type=all`, `source` never removes fetch rows
+- if `type=all` and `source=all`, include all event types, including `resource`
+- if `type=all` and `source!=all`, keep `fetch` + matching hi rows (resource rows are excluded by this filter shape)
 - `hide_likely_crawlers=true` requires `likely_crawler = 0`
 - `q` matches case-insensitively against:
   - `agent_name`
@@ -738,9 +819,19 @@ All accepted writes must be transactional.
 
 Accepted write paths:
 
+- `GET /llms.txt`
+- `GET /ai/recipe.md`
+- `GET /banana-muffins.md`
 - `GET /agent.txt`
 - `GET /hi`
 - `POST /hi`
+
+Resource endpoint transaction:
+
+1. normalize request metadata
+2. attempt to insert `resource` row into `events`
+3. if legacy `event_type` check rejects `resource`, insert fallback row into `resource_reads`
+4. commit
 
 `GET /agent.txt` transaction:
 
@@ -828,6 +919,7 @@ The frontend must:
 Backend tests must cover:
 
 - `GET /agent.txt` logs `fetch`
+- `GET /llms.txt`, `GET /ai/recipe.md`, and `GET /banana-muffins.md` log `resource` (or `resource_reads` fallback for legacy schema)
 - `GET /agent.txt` returns recipe text and a token
 - `GET /agent.txt` enforces rate limits
 - `GET /hi` logs `hi_get`
@@ -856,7 +948,7 @@ Frontend tests must cover:
 
 Implementation is complete when:
 
-- the app measures `fetch`, `hi_get`, `hi_post`, `hi_post_token`, and `hi_total`
+- the app measures `resource`, `fetch`, `hi_get`, `hi_post`, `hi_post_token`, and `hi_total`
 - `GET /hi` and `POST /hi` are clearly distinguished
 - token-backed POSTs are counted separately
 - invalid or expired token attempts fail cleanly

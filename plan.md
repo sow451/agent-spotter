@@ -22,6 +22,7 @@ The product now has two layers:
   - `/llms.txt`
   - homepage note for agents
   - `/ai/*.md` pointer pages
+  - `/banana-muffins.md` full markdown canary
 - Experiment layer:
   - `GET /agent.txt`
   - `GET /hi`
@@ -29,12 +30,13 @@ The product now has two layers:
 
 The invitation layer points callers toward the experiment.
 The experiment layer records what they actually do.
-The invitation pages may live on a different service, but they must always point callers to the canonical backend origin for `/agent.txt`, `/hi`, and `/events`.
+The invitation pages may live on a different service, but they must always point callers to the canonical backend origin for `/llms.txt`, `/ai/recipe.md`, `/banana-muffins.md`, `/agent.txt`, `/hi`, and `/events`.
 
 ## Signal Ladder
 
-The MVP should track four distinct signals:
+The MVP should track five distinct signals:
 
+- `resource` = caller read invitation/canary markdown/text endpoints (`/llms.txt`, `/ai/recipe.md`, `/banana-muffins.md`)
 - `fetch` = caller requested `GET /agent.txt`
 - `hi_get` = caller used the easy fallback `GET /hi`
 - `hi_post` = caller used `POST /hi` without a valid token
@@ -46,7 +48,7 @@ Derived aggregate:
 
 Primary ratio:
 
-- `hi_total / fetch`
+- `fetch / hi_total`
 
 Secondary ratio:
 
@@ -54,10 +56,42 @@ Secondary ratio:
 
 Interpretation:
 
+- `resource` indicates discovery/consumption only
 - `hi_get` is the weakest follow-through signal
 - `hi_post` is a stronger signal
 - `hi_post_token` is the strongest follow-through signal in this open design
 - none of these prove identity
+
+## Graph Funnel Readout
+
+Treat analysis as a graph rather than a strict linear funnel.
+
+Windowed unique-source variables:
+
+- `N` = unique sources touching any tracked endpoint
+- `X` = unique sources with `resource`
+- `Y` = unique sources with `fetch`
+- `Z` = unique sources with any hi (`hi_get` or `hi_post`)
+- `A` = unique sources with `POST /hi`
+- `A1` = unique sources with non-token `POST /hi`
+- `A2` = unique sources with token-valid `POST /hi`
+
+Reportable percentages:
+
+- `x% = X / N`
+- `y% = Y / N`
+- `z% = Z / N`
+- `a% = A / N`
+- `a1% = A1 / N`
+- `a2% = A2 / N`
+
+Reportable edge conversions:
+
+- `X -> Y`
+- `X -> Z`
+- `Y -> Z`
+- `Z -> A`
+- `Y -> A2`
 
 ## Repo Structure
 
@@ -91,6 +125,7 @@ Use SQLite for MVP.
 At minimum, backend storage must support:
 
 - raw event logging
+- invitation/canary resource-read logging
 - short-lived token issuance and validation
 - cached counters for `/events`
 - approximate UTC-day unique-source counting using a salted `ip_hash`
@@ -98,7 +133,7 @@ At minimum, backend storage must support:
 ### High-Level Tables
 
 - `events`
-  - stores fetches and hi events
+  - stores resource reads, fetches, and hi events
 - `hi_tokens`
   - stores one-time tokens issued by `GET /agent.txt`
 - `source_windows`
@@ -110,6 +145,7 @@ At minimum, backend storage must support:
 
 The backend should log these event types:
 
+- `resource`
 - `fetch`
 - `hi_get`
 - `hi_post`
@@ -144,6 +180,20 @@ Keep basic rate limiting in MVP:
 - use the hash for approximate repeat-source detection and basic rate limiting
 
 ## Step 2 - API Surface
+
+### Invitation/Canary endpoints
+
+Endpoints:
+
+- `GET /llms.txt`
+- `GET /ai/recipe.md`
+- `GET /banana-muffins.md`
+
+Behavior:
+
+- return machine-readable text/markdown
+- log a `resource` event on each request
+- `/banana-muffins.md` serves the full recipe markdown and includes optional follow-through URLs
 
 ### `GET /agent.txt`
 
@@ -233,6 +283,11 @@ The response should make these counters explicit:
 - `refresh` metadata (`cadence_seconds`, `cadence_minutes`, `last_refreshed_at`, `next_refresh_at`)
 - `has_more` for older-page availability
 
+Feed behavior note:
+
+- event feed rows may include `resource` entries
+- aggregate counters remain focused on fetch/hi families for continuity
+
 ## Step 3 - Frontend (Streamlit)
 
 ### Layout
@@ -287,6 +342,8 @@ SQLite note:
 
 After deployment:
 
+- confirm `GET /llms.txt` and `GET /ai/recipe.md` log `resource`
+- confirm `GET /banana-muffins.md` serves full markdown recipe and logs `resource`
 - confirm `GET /agent.txt` works and logs `fetch`
 - confirm `GET /hi` works and logs `hi_get`
 - confirm `POST /hi` works without a token and logs `hi_post`
@@ -296,11 +353,14 @@ After deployment:
 
 After the observation window:
 
+- report `resource`
 - report `fetch`
 - report `hi_get`, `hi_post`, and `hi_post_token`
 - report `hi_total`
 - report `ratio_total`
 - report `ratio_unknown`
+- report graph percentages (`x%`, `y%`, `z%`, `a%`, `a1%`, `a2%`)
+- report edge conversions (`X->Y`, `X->Z`, `Y->Z`, `Z->A`, `Y->A2`)
 - report approximate unique activity
 - summarize user-agent patterns
 - describe limitations clearly

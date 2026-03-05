@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 ALLOWED_SOURCE_KINDS = {"none", "unknown", "manual", "agent"}
-ALLOWED_EVENT_TYPES = {"fetch", "hi_get", "hi_post"}
+ALLOWED_EVENT_TYPES = {"fetch", "hi_get", "hi_post", "resource"}
 EVENTS_REFRESH_CADENCE_SECONDS = 600
 TOKEN_TTL_SECONDS = 60
 FETCH_RATE_LIMIT_PER_MINUTE = 60
@@ -186,6 +186,69 @@ def enforce_events_rate_limit(
 
 def record_fetch(database_path: str, context: dict[str, Any]) -> None:
     record_fetch_and_issue_token(database_path, context)
+
+
+def record_resource_access(
+    database_path: str,
+    context: dict[str, Any],
+    *,
+    path: str,
+) -> None:
+    with create_connection(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO events (
+                    ts,
+                    event_type,
+                    path,
+                    agent_name,
+                    message,
+                    source_kind,
+                    user_agent,
+                    ip_hash,
+                    likely_crawler,
+                    token_used
+                ) VALUES (?, 'resource', ?, NULL, NULL, 'none', ?, ?, ?, 0)
+                """,
+                (
+                    context["ts"],
+                    path,
+                    context["user_agent"],
+                    context["ip_hash"],
+                    int(context["likely_crawler"]),
+                ),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            if _is_legacy_event_type_check_error(exc):
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO resource_reads (
+                        ts,
+                        path,
+                        user_agent,
+                        ip_hash,
+                        likely_crawler
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        context["ts"],
+                        path,
+                        context["user_agent"],
+                        context["ip_hash"],
+                        int(context["likely_crawler"]),
+                    ),
+                )
+                connection.commit()
+                return
+            raise
+        except Exception:
+            connection.rollback()
+            raise
 
 
 def record_fetch_and_issue_token(
@@ -404,9 +467,11 @@ def list_events(
             """,
             (*params, limit),
         ).fetchall()
+        resource_count = _count_events(connection, "event_type = 'resource'")
 
     refresh = _refresh_payload(now)
     counters = {
+        "resource": int(resource_count),
         "fetch": int(stats["fetch_count"]),
         "hi_get": int(stats["hi_get_count"]),
         "hi_post": int(stats["hi_post_count"]),
@@ -701,7 +766,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
-            event_type TEXT NOT NULL CHECK (event_type IN ('fetch', 'hi_get', 'hi_post')),
+            event_type TEXT NOT NULL CHECK (event_type IN ('fetch', 'hi_get', 'hi_post', 'resource')),
             path TEXT NOT NULL,
             agent_name TEXT,
             message TEXT,
@@ -770,6 +835,18 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS resource_reads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            path TEXT NOT NULL,
+            user_agent TEXT NOT NULL DEFAULT '',
+            ip_hash TEXT NOT NULL,
+            likely_crawler INTEGER NOT NULL CHECK (likely_crawler IN (0, 1))
+        )
+        """
+    )
 
     connection.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_desc ON events(ts DESC)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_events_event_id ON events(event_type, id DESC)")
@@ -790,6 +867,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_source_windows_day_ip_event_token ON source_windows(window_day, ip_hash, event_type, token_used)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resource_reads_path_id ON resource_reads(path, id DESC)"
     )
 
 
@@ -924,11 +1004,7 @@ def _ensure_schema_compatible_or_empty(connection: sqlite3.Connection) -> None:
         },
     )
 
-    _validate_check_fragment(
-        connection,
-        "events",
-        "check (event_type in ('fetch', 'hi_get', 'hi_post'))",
-    )
+    _validate_events_event_type_check(connection)
     _validate_check_fragment(
         connection,
         "events",
@@ -1025,6 +1101,27 @@ def _validate_check_fragment(connection: sqlite3.Connection, table_name: str, fr
     normalized_fragment = " ".join(fragment.strip().lower().split())
     if normalized_fragment not in normalized_sql:
         raise _schema_error(f"{table_name} missing required CHECK constraint")
+
+
+def _validate_events_event_type_check(connection: sqlite3.Connection) -> None:
+    normalized_sql = _normalized_create_sql(connection, "events")
+    if not normalized_sql:
+        return
+
+    allowed_fragments = (
+        "check (event_type in ('fetch', 'hi_get', 'hi_post', 'resource'))",
+        "check (event_type in ('fetch', 'hi_get', 'hi_post'))",
+    )
+    normalized_allowed = {
+        " ".join(fragment.strip().lower().split()) for fragment in allowed_fragments
+    }
+    if not any(fragment in normalized_sql for fragment in normalized_allowed):
+        raise _schema_error("events missing required event_type CHECK constraint")
+
+
+def _is_legacy_event_type_check_error(exc: sqlite3.IntegrityError) -> bool:
+    message = str(exc).lower()
+    return "check constraint failed" in message and "event_type" in message
 
 
 def _validate_hi_tokens_foreign_key(connection: sqlite3.Connection) -> None:

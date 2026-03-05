@@ -491,6 +491,53 @@ def test_refresh_status_text_reports_last_refresh(monkeypatch) -> None:
     assert "Last refreshed on 2026-03-04 00:10:00 UTC." in status
 
 
+def test_main_renders_refresh_caption_after_sync_populates_metadata(monkeypatch) -> None:
+    app = importlib.import_module("frontend.app")
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setenv("BACKEND_URL", "http://frontend.test/")
+
+    monkeypatch.setattr(app, "_render_css", lambda: None)
+    monkeypatch.setattr(app, "_render_sidebar", lambda _backend_url: None)
+    monkeypatch.setattr(app, "_render_signal_board", lambda _counters: None)
+    monkeypatch.setattr(app, "_render_event_feed", lambda _events: None)
+    monkeypatch.setattr(app, "_render_message_ticker", lambda _events: None)
+    monkeypatch.setattr(app, "_render_auto_refresh_timer", lambda: None)
+
+    def record_controls():
+        return (
+            {
+                "route": "All routes",
+                "type": "all",
+                "source": "all",
+                "hide_likely_crawlers": False,
+                "q": "",
+                "limit": 50,
+                "sort_order": "Newest to Oldest",
+            },
+            False,
+            False,
+            False,
+        )
+
+    def record_sync(_backend_url: str, _filters: dict[str, object], **_kwargs) -> None:
+        fake_st.session_state["feed_last_refreshed_at"] = "2026-03-04T00:10:00.000Z"
+        fake_st.session_state["feed_counters"] = {}
+        fake_st.session_state["feed_events"] = []
+        fake_st.session_state["feed_error"] = ""
+        fake_st.session_state["feed_notice"] = ""
+
+    monkeypatch.setattr(app, "_render_controls", record_controls)
+    monkeypatch.setattr(app, "_sync_feed", record_sync)
+
+    app.main()
+
+    assert any(
+        "Last refreshed on 2026-03-04 00:10:00 UTC." in body for body in fake_st.caption_calls
+    )
+    assert not any("waiting for first load" in body.lower() for body in fake_st.caption_calls)
+
+
 def test_sync_feed_reports_missing_requests_dependency(monkeypatch) -> None:
     app = importlib.import_module("frontend.app")
     fake_st = _FakeStreamlit()

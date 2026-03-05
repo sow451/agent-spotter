@@ -79,6 +79,23 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 6. Align product documentation language (`context.md`) so `/events` auth is not in tension with the “Authentication” non-goal wording.
 7. Keep `SALT` and frontend-backend auth material strictly in platform secrets and enforce regular rotation.
 
+## Implications If Deferred (MVP Context)
+
+1. SQLite-only storage:
+Lower write concurrency and horizontal scaling headroom; acceptable for short-window MVP traffic, not high-scale operations.
+2. No retention lifecycle:
+Unbounded data growth and eventual performance/ops drag; acceptable for MVP only with a planned cleanup checkpoint.
+3. Incomplete proxy hardening:
+Possible IP spoofing/misclassification risk if proxy trust is misconfigured; acceptable for MVP only with conservative trusted-header configuration.
+4. Static shared `/events` token:
+Higher blast radius if leaked and weaker revocation granularity; acceptable for MVP only with strict secret handling and rotation procedures.
+5. Limited operator diagnostics:
+Slower incident triage and recovery during outages; acceptable for MVP with expectation of more manual debugging.
+
+Launch interpretation:
+- MVP learning launch: acceptable with the above guardrails.
+- High-scale public launch: these remain blocking hardening items.
+
 ## Practical Next Steps (Fixes + Tests)
 
 1. Add a Postgres-backed integration test lane that validates migration parity for counters, unique-day logic, token flow, and `/events` query behavior.

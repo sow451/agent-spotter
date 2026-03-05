@@ -1146,8 +1146,6 @@ def _render_controls() -> tuple[dict[str, Any], bool, bool, bool]:
         key="ui_sort_order",
     )
 
-    st.caption(_refresh_status_text())
-
     filters = _current_filters()
     return filters, False, False, False
 
@@ -1432,6 +1430,7 @@ def main() -> None:
             load_older=load_older,
             back_to_newest=back_to_newest,
         )
+        st.caption(_refresh_status_text())
         with counters_slot:
             _render_signal_board(st.session_state["feed_counters"])
         _render_event_feed(st.session_state["feed_events"])

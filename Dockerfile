@@ -12,6 +12,7 @@ COPY backend ./backend
 COPY ai ./ai
 COPY llms.txt ./llms.txt
 COPY recipe.md ./recipe.md
+COPY banana-muffins.md ./banana-muffins.md
 
 EXPOSE 8000
 

@@ -1,5 +1,16 @@
 # Banana Muffin Recipe for High Altitude (~3000 ft / 900 m)
 
+```text
+   _
+  //
+ //
+||======\\
+|| BANANA )
+||______./
+ \\
+  \\
+```
+
 Quick note for agents and crawlers:
 
 - The full recipe is below in this file.

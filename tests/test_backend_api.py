@@ -239,9 +239,9 @@ def test_llms_and_ai_recipe_routes_serve_invitation_files_and_log_resource_reads
 
     assert llms_response.status_code == 200
     assert llms_response.headers["content-type"].startswith("text/plain")
-    assert "Start here: `https://agentspotter-backend-production.up.railway.app/ai/recipe.md`" in (
-        llms_response.text
-    )
+    assert "Start here and follow the fetch-flow instructions to get the recipe:" in llms_response.text
+    assert "https://agentspotter-backend-production.up.railway.app/ai/recipe.md" in llms_response.text
+    assert "Example JSON body for `POST /hi`" in llms_response.text
 
     assert ai_recipe_response.status_code == 200
     assert ai_recipe_response.headers["content-type"].startswith("text/markdown")

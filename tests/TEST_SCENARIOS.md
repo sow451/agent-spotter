@@ -13,8 +13,15 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 
 - Run completed: 2026-03-05 IST (Asia/Kolkata)
 - Command used: `./.venv/bin/python -m pytest -q`
-- Result: `63 passed, 2 skipped`
+- Result: `67 passed, 2 skipped`
 - Failures: none
+
+## Recent Failure Note (2026-03-05)
+
+- A production/internal-server-error incident occurred on `GET /banana-muffins.md` because the Docker image did not include `banana-muffins.md`.
+- Root cause: `Dockerfile` copied `llms.txt` and `recipe.md`, but missed `banana-muffins.md`.
+- Resolution: added `COPY banana-muffins.md ./banana-muffins.md` and redeployed.
+- Coverage implication: local route tests passed because the file exists in the repo checkout; deployment-packaging coverage must also assert invitation file availability in the built container.
 
 ## Backend Scenarios Covered
 
@@ -70,6 +77,7 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 2. We still do not cover every optional-field edge case (for example every bad type/length combination for every field on both GET and POST).
 3. We still do not have browser-level verification of the rendered page.
 4. Two deployment/integration tests are environment-skippable and require Docker + local socket bind permissions to run in CI.
+5. The Docker smoke coverage currently validates startup and `/events` auth but does not yet assert invitation-resource routes like `/llms.txt`, `/ai/recipe.md`, and `/banana-muffins.md` from the built image.
 
 ## Post-Launch Fixes
 
@@ -108,3 +116,4 @@ Launch interpretation:
 6. Add backend coverage proving repeated requests from the same source do not inflate UTC-day unique counters.
 7. Add browser-level end-to-end verification of the rendered dashboard flow.
 8. Expand `GET /hi` validation-edge tests for overlong query params and additional bad-type combinations.
+9. Extend deployment smoke tests to verify `200` responses for `/llms.txt`, `/ai/recipe.md`, and `/banana-muffins.md` from the Dockerized backend so file-packaging misses are caught before deploy.

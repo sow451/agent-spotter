@@ -64,16 +64,6 @@ HI_ASCII = """
 |  _  || |
 |_| |_|___|
 """.strip("\n")
-BANANA_ASCII = """
-   _
-  //
- //
-||======\\\\
-|| BANANA )
-||______./
- \\\\
-  \\\\
-""".strip("\n")
 PROFANITY_PATTERN = re.compile(
     r"\b(?:asshole|bastard|bitch|damn|fuck|shit)\b",
     re.IGNORECASE,
@@ -1577,7 +1567,6 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     _render_console_banner("home-hi", HI_ASCII)
-    _render_console_banner("home-banana", BANANA_ASCII)
 
     left_column, right_column = st.columns([1.0, 2.2], gap="large")
 

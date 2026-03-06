@@ -86,6 +86,11 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 3. Public-feed rate limiting writes to `endpoint_hits` on each request and runs cleanup churn in the hot path; this is covered functionally but not yet load-tested for SQLite lock contention behavior.
 4. `/events/public` currently enforces a key allowlist via code-level mapping and tests, but there is no framework-level typed response model to hard-fail value-shape drift.
 
+## Tomorrow Ops Follow-Ups
+
+1. Create a manual backup snapshot of production `DATABASE_PATH` (`/data/events.db`) before additional traffic or schema changes.
+2. Add monitoring/alerts for backend `5xx` responses with an explicit check on `/events/public`, plus a simple kill-switch runbook entry.
+
 ## Post-Launch Fixes
 
 1. Move production storage to managed Postgres (or equivalent) with parity schema/indexes and an explicit migration path from SQLite.

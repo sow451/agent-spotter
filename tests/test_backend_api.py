@@ -10,13 +10,54 @@ from backend import db
 from backend.main import RECIPE_PATH, create_app
 
 EVENTS_AUTH_HEADER = {"Authorization": "Bearer frontend-test-token"}
+EVENTS_RESPONSE_KEYS = {"refresh", "counters", "events", "has_more"}
+PUBLIC_EVENT_KEYS = {"id", "ts", "event_type", "path", "source_kind", "token_used"}
+PUBLIC_REFRESH_KEYS = {"cadence_seconds", "cadence_minutes", "last_refreshed_at", "next_refresh_at"}
+PUBLIC_COUNTER_KEYS = {
+    "resource",
+    "fetch",
+    "hi_get",
+    "hi_post",
+    "hi_post_token",
+    "hi_total",
+    "hi_unknown",
+    "hi_manual",
+    "hi_agent",
+    "fetch_unique_utc_day",
+    "hi_total_unique_utc_day",
+    "hi_post_token_unique_utc_day",
+    "ratio_total",
+    "ratio_unknown",
+}
+INTERNAL_EVENT_KEYS = {
+    "id",
+    "ts",
+    "event_type",
+    "path",
+    "agent_name",
+    "message",
+    "source_kind",
+    "user_agent",
+    "likely_crawler",
+    "token_used",
+}
 
 
-def _make_test_client(database_path, monkeypatch, *, trust_proxy_headers: str = "false") -> TestClient:
+def _make_test_client(
+    database_path,
+    monkeypatch,
+    *,
+    trust_proxy_headers: str = "false",
+    events_public_enabled: str | None = None,
+) -> TestClient:
     monkeypatch.setenv("DATABASE_PATH", str(database_path))
     monkeypatch.setenv("SALT", "test-salt")
     monkeypatch.setenv("TRUST_PROXY_HEADERS", trust_proxy_headers)
     monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+    if events_public_enabled is None:
+        monkeypatch.delenv("EVENTS_PUBLIC_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("EVENTS_PUBLIC_ENABLED", events_public_enabled)
     return TestClient(create_app())
 
 
@@ -611,6 +652,34 @@ def test_create_app_requires_frontend_api_token(database_path, monkeypatch) -> N
         create_app()
 
 
+def test_create_app_defaults_events_public_enabled_to_false_when_unset(
+    database_path,
+    monkeypatch,
+) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+    monkeypatch.delenv("EVENTS_PUBLIC_ENABLED", raising=False)
+
+    app = create_app()
+
+    assert app.state.events_public_enabled is False
+
+
+def test_create_app_rejects_invalid_events_public_enabled_value(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    monkeypatch.setenv("DATABASE_PATH", str(database_path))
+    monkeypatch.setenv("SALT", "test-salt")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
+    monkeypatch.setenv("EVENTS_PUBLIC_ENABLED", "definitely")
+
+    with pytest.raises(RuntimeError, match="EVENTS_PUBLIC_ENABLED must be true or false when set"):
+        create_app()
+
+
 def test_create_app_requires_database_path_in_managed_runtime(monkeypatch) -> None:
     monkeypatch.delenv("DATABASE_PATH", raising=False)
     monkeypatch.setenv("SALT", "test-salt")
@@ -1109,6 +1178,199 @@ def test_get_events_requires_frontend_api_token(client) -> None:
     assert invalid.status_code == 401
     assert invalid.json() == {"detail": "unauthorized"}
     assert valid.status_code == 200
+
+
+def test_get_public_events_returns_503_when_disabled(client) -> None:
+    response = client.get("/events/public")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "public events feed is disabled"}
+
+
+def test_get_public_events_returns_allowlist_shape(database_path, monkeypatch) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        fetch_response = client.get("/agent.txt")
+        token = _extract_token(fetch_response.text)
+        client.get("/hi", params={"agent": "reader", "source": "manual", "message": "manual hi"})
+        client.post("/hi", json={"agent_name": "Scout", "source": "agent", "token": token})
+
+        response = client.get(
+            "/events/public",
+            params={"type": "all", "source": "all", "hide_likely_crawlers": True, "limit": 10},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload.keys()) == EVENTS_RESPONSE_KEYS
+    assert set(payload["refresh"].keys()) == PUBLIC_REFRESH_KEYS
+    assert set(payload["counters"].keys()) == PUBLIC_COUNTER_KEYS
+    assert isinstance(payload["events"], list)
+    assert isinstance(payload["has_more"], bool)
+
+
+def test_get_public_events_rate_limits_independently_from_internal_events(database_path, monkeypatch) -> None:
+    monkeypatch.setattr(db, "EVENTS_PUBLIC_RATE_LIMIT_PER_MINUTE", 1)
+    monkeypatch.setattr(db, "EVENTS_PUBLIC_RATE_LIMIT_PER_HOUR", 20)
+    monkeypatch.setattr(db, "EVENTS_RATE_LIMIT_PER_MINUTE", 5)
+    monkeypatch.setattr(db, "EVENTS_RATE_LIMIT_PER_HOUR", 20)
+
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        public_first = client.get("/events/public", params={"limit": 10})
+        public_blocked = client.get("/events/public", params={"limit": 10})
+        internal_ok = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER)
+
+    assert public_first.status_code == 200
+    assert public_blocked.status_code == 429
+    assert public_blocked.json() == {"detail": "rate limit exceeded"}
+    assert internal_ok.status_code == 200
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        public_hit_count = connection.execute(
+            """
+            SELECT COUNT(*) AS hit_count
+            FROM endpoint_hits
+            WHERE endpoint = '/events/public'
+            """
+        ).fetchone()["hit_count"]
+        internal_hit_count = connection.execute(
+            """
+            SELECT COUNT(*) AS hit_count
+            FROM endpoint_hits
+            WHERE endpoint = '/events'
+            """
+        ).fetchone()["hit_count"]
+
+    assert public_hit_count == 1
+    assert internal_hit_count == 1
+
+
+def test_get_public_events_hides_forbidden_event_fields(database_path, monkeypatch) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        client.post(
+            "/hi",
+            json={"agent_name": "Manual One", "source": "manual", "message": "checking in"},
+            headers={"User-Agent": "curl/8.7.1"},
+        )
+        response = client.get("/events/public", params={"type": "hi", "source": "manual", "limit": 10})
+
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert len(events) == 1
+    assert set(events[0].keys()) == PUBLIC_EVENT_KEYS
+    assert "agent_name" not in events[0]
+    assert "message" not in events[0]
+    assert "user_agent" not in events[0]
+    assert "likely_crawler" not in events[0]
+
+
+def test_get_public_events_enforces_strict_schema_for_multiple_event_types(
+    database_path,
+    monkeypatch,
+) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        fetch_response = client.get("/agent.txt", headers={"User-Agent": "Browser/1.0"})
+        token = _extract_token(fetch_response.text)
+        client.get("/llms.txt", headers={"User-Agent": "ResourceReader/1.0"})
+        client.get(
+            "/hi",
+            params={"agent": "reader", "source": "manual", "message": "manual hi"},
+            headers={"User-Agent": "Browser/1.0"},
+        )
+        client.post(
+            "/hi",
+            json={"agent_name": "Scout", "source": "agent", "message": "token hi", "token": token},
+            headers={"User-Agent": "python-requests/2.32.0"},
+        )
+        response = client.get(
+            "/events/public",
+            params={"type": "all", "source": "all", "hide_likely_crawlers": True, "limit": 20},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload.keys()) == EVENTS_RESPONSE_KEYS
+
+    events = payload["events"]
+    assert {"fetch", "hi_get", "hi_post", "resource"} <= {event["event_type"] for event in events}
+    assert any(event["event_type"] == "hi_post" and event["token_used"] is True for event in events)
+    assert all(set(event.keys()) == PUBLIC_EVENT_KEYS for event in events)
+
+
+def test_get_public_events_caps_limit_to_fifty(database_path, monkeypatch) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        for _ in range(55):
+            client.get("/agent.txt")
+        response = client.get("/events/public", params={"limit": 500})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["events"]) == 50
+    assert payload["has_more"] is True
+
+
+def test_get_public_events_validates_filters_and_rejects_disabled_query_fields(
+    database_path,
+    monkeypatch,
+) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        invalid_type = client.get("/events/public", params={"type": "bogus"})
+        invalid_source = client.get("/events/public", params={"source": "bogus"})
+        unsupported_q = client.get("/events/public", params={"q": "token"})
+        unsupported_before_id = client.get("/events/public", params={"before_id": 123})
+
+    assert invalid_type.status_code == 400
+    assert invalid_type.json() == {"detail": "invalid type"}
+    assert invalid_source.status_code == 400
+    assert invalid_source.json() == {"detail": "invalid source"}
+    assert unsupported_q.status_code == 400
+    assert unsupported_q.json() == {"detail": "q is not supported on /events/public"}
+    assert unsupported_before_id.status_code == 400
+    assert unsupported_before_id.json() == {"detail": "before_id is not supported on /events/public"}
+
+
+def test_get_public_events_does_not_require_auth(database_path, monkeypatch) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        no_auth = client.get("/events/public", params={"limit": 10})
+        wrong_auth = client.get(
+            "/events/public",
+            params={"limit": 10},
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+
+    assert no_auth.status_code == 200
+    assert wrong_auth.status_code == 200
+
+
+def test_internal_events_contract_unchanged_when_public_events_enabled(
+    database_path,
+    monkeypatch,
+) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        client.post(
+            "/hi",
+            json={"agent_name": "Manual One", "source": "manual", "message": "checking in"},
+            headers={"User-Agent": "curl/8.7.1"},
+        )
+        public_response = client.get("/events/public", params={"type": "hi", "source": "manual", "limit": 10})
+        internal_unauthorized = client.get("/events", params={"type": "hi", "source": "manual", "limit": 10})
+        internal_authorized = client.get(
+            "/events",
+            params={"type": "hi", "source": "manual", "limit": 10},
+            headers=EVENTS_AUTH_HEADER,
+        )
+
+    assert public_response.status_code == 200
+    assert internal_unauthorized.status_code == 401
+    assert internal_unauthorized.json() == {"detail": "unauthorized"}
+    assert internal_authorized.status_code == 200
+
+    public_event = public_response.json()["events"][0]
+    internal_event = internal_authorized.json()["events"][0]
+
+    assert set(public_event.keys()) == PUBLIC_EVENT_KEYS
+    assert set(internal_event.keys()) == INTERNAL_EVENT_KEYS
+    assert set(public_event.keys()) < set(internal_event.keys())
 
 
 def test_get_events_rejects_malformed_authorization_headers(client) -> None:

@@ -18,6 +18,8 @@ HI_POST_RATE_LIMIT_PER_MINUTE = 3
 HI_POST_RATE_LIMIT_PER_HOUR = 20
 EVENTS_RATE_LIMIT_PER_MINUTE = 1500
 EVENTS_RATE_LIMIT_PER_HOUR = 20000
+EVENTS_PUBLIC_RATE_LIMIT_PER_MINUTE = 300
+EVENTS_PUBLIC_RATE_LIMIT_PER_HOUR = 4000
 REQUIRED_INDEX_NAMES = {
     "idx_events_ts_desc",
     "idx_events_event_id",
@@ -155,6 +157,45 @@ def enforce_events_rate_limit(
     resolved_minute_limit = EVENTS_RATE_LIMIT_PER_MINUTE if minute_limit is None else minute_limit
     resolved_hour_limit = EVENTS_RATE_LIMIT_PER_HOUR if hour_limit is None else hour_limit
 
+    _enforce_endpoint_rate_limit(
+        database_path=database_path,
+        context=context,
+        endpoint="/events",
+        minute_limit=resolved_minute_limit,
+        hour_limit=resolved_hour_limit,
+    )
+
+
+def enforce_events_public_rate_limit(
+    database_path: str,
+    context: dict[str, Any],
+    *,
+    minute_limit: int | None = None,
+    hour_limit: int | None = None,
+) -> None:
+    resolved_minute_limit = (
+        EVENTS_PUBLIC_RATE_LIMIT_PER_MINUTE if minute_limit is None else minute_limit
+    )
+    resolved_hour_limit = EVENTS_PUBLIC_RATE_LIMIT_PER_HOUR if hour_limit is None else hour_limit
+
+    _enforce_endpoint_rate_limit(
+        database_path=database_path,
+        context=context,
+        endpoint="/events/public",
+        minute_limit=resolved_minute_limit,
+        hour_limit=resolved_hour_limit,
+    )
+
+
+def _enforce_endpoint_rate_limit(
+    *,
+    database_path: str,
+    context: dict[str, Any],
+    endpoint: str,
+    minute_limit: int,
+    hour_limit: int,
+) -> None:
+
     with create_connection(database_path) as connection:
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -162,11 +203,11 @@ def enforce_events_rate_limit(
 
             if _is_endpoint_rate_limited(
                 connection=connection,
-                endpoint="/events",
+                endpoint=endpoint,
                 ip_hash=context["ip_hash"],
                 now=context["now"],
-                minute_limit=resolved_minute_limit,
-                hour_limit=resolved_hour_limit,
+                minute_limit=minute_limit,
+                hour_limit=hour_limit,
             ):
                 connection.rollback()
                 raise RateLimitExceeded()
@@ -174,9 +215,9 @@ def enforce_events_rate_limit(
             connection.execute(
                 """
                 INSERT INTO endpoint_hits (ts, endpoint, ip_hash)
-                VALUES (?, '/events', ?)
+                VALUES (?, ?, ?)
                 """,
-                (context["ts"], context["ip_hash"]),
+                (context["ts"], endpoint, context["ip_hash"]),
             )
             connection.commit()
         except Exception:

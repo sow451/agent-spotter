@@ -30,6 +30,25 @@ RECIPE_PATH = PROJECT_ROOT / "recipe.md"
 CANARY_RECIPE_PATH = PROJECT_ROOT / "banana-muffins.md"
 EVENTS_AUTH_SCHEME = "bearer"
 DEFAULT_DATABASE_PATH = "events.db"
+PUBLIC_EVENTS_MAX_LIMIT = 50
+PUBLIC_EVENT_FIELDS = ("id", "ts", "event_type", "path", "source_kind", "token_used")
+PUBLIC_REFRESH_FIELDS = ("cadence_seconds", "cadence_minutes", "last_refreshed_at", "next_refresh_at")
+PUBLIC_COUNTER_FIELDS = (
+    "resource",
+    "fetch",
+    "hi_get",
+    "hi_post",
+    "hi_post_token",
+    "hi_total",
+    "hi_unknown",
+    "hi_manual",
+    "hi_agent",
+    "fetch_unique_utc_day",
+    "hi_total_unique_utc_day",
+    "hi_post_token_unique_utc_day",
+    "ratio_total",
+    "ratio_unknown",
+)
 MANAGED_RUNTIME_MARKERS = {
     "RAILWAY_ENVIRONMENT",
     "RAILWAY_PROJECT_ID",
@@ -46,6 +65,7 @@ def create_app() -> FastAPI:
     app.state.salt = _load_required_salt()
     app.state.trust_proxy_headers = _load_required_proxy_setting()
     app.state.frontend_api_token = _load_required_frontend_api_token()
+    app.state.events_public_enabled = _load_events_public_enabled()
 
     db.initialize_database(app.state.database_path)
 
@@ -209,6 +229,50 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(payload)
 
+    @app.get("/events/public")
+    async def get_public_events(
+        request: Request,
+        event_type: str = Query("all", alias="type"),
+        source: str = Query("all"),
+        hide_likely_crawlers: bool = Query(False),
+        q: str | None = Query(None),
+        limit: int = Query(PUBLIC_EVENTS_MAX_LIMIT, ge=1),
+        before_id: int | None = Query(None),
+    ) -> JSONResponse:
+        if not app.state.events_public_enabled:
+            raise HTTPException(status_code=503, detail="public events feed is disabled")
+        if q is not None:
+            raise HTTPException(status_code=400, detail="q is not supported on /events/public")
+        if before_id is not None:
+            raise HTTPException(status_code=400, detail="before_id is not supported on /events/public")
+
+        context = db.build_request_context(
+            request=request,
+            salt=app.state.salt,
+            trust_proxy_headers=app.state.trust_proxy_headers,
+        )
+        try:
+            db.enforce_events_public_rate_limit(
+                app.state.database_path,
+                context,
+            )
+        except Exception as exc:
+            if _is_db_exception(exc, "RateLimitExceeded"):
+                raise HTTPException(status_code=429, detail="rate limit exceeded") from exc
+            raise
+        _validate_events_filters(event_type=event_type, source=source)
+
+        payload = db.list_events(
+            app.state.database_path,
+            event_type=event_type,
+            source=source,
+            hide_likely_crawlers=hide_likely_crawlers,
+            q="",
+            limit=min(limit, PUBLIC_EVENTS_MAX_LIMIT),
+            before_id=None,
+        )
+        return JSONResponse(_public_events_payload(payload))
+
     return app
 
 
@@ -272,6 +336,18 @@ def _load_required_frontend_api_token() -> str:
     if not token:
         raise RuntimeError("FRONTEND_API_TOKEN is required for backend startup")
     return token
+
+
+def _load_events_public_enabled() -> bool:
+    raw_value = os.getenv("EVENTS_PUBLIC_ENABLED")
+    if raw_value is None:
+        return False
+    if not raw_value.strip():
+        return False
+    try:
+        return _env_flag(raw_value)
+    except ValueError as exc:
+        raise RuntimeError("EVENTS_PUBLIC_ENABLED must be true or false when set") from exc
 
 
 def _require_events_token(request: Request, expected_token: str) -> None:
@@ -391,6 +467,33 @@ def _validate_events_filters(*, event_type: str, source: str) -> None:
         raise HTTPException(status_code=400, detail="invalid type")
     if source not in ALLOWED_SOURCE_FILTERS:
         raise HTTPException(status_code=400, detail="invalid source")
+
+
+def _public_events_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    refresh = payload.get("refresh")
+    public_refresh = {
+        field: refresh.get(field) for field in PUBLIC_REFRESH_FIELDS
+    } if isinstance(refresh, dict) else {field: None for field in PUBLIC_REFRESH_FIELDS}
+
+    counters = payload.get("counters")
+    public_counters = {
+        field: counters.get(field) for field in PUBLIC_COUNTER_FIELDS
+    } if isinstance(counters, dict) else {field: None for field in PUBLIC_COUNTER_FIELDS}
+
+    events = payload.get("events")
+    public_events: list[dict[str, Any]] = []
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            public_events.append({field: event.get(field) for field in PUBLIC_EVENT_FIELDS})
+
+    return {
+        "refresh": public_refresh,
+        "counters": public_counters,
+        "events": public_events,
+        "has_more": bool(payload.get("has_more", False)),
+    }
 
 
 def _record_fetch_response(database_path: str, context: dict[str, Any]) -> str:

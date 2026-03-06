@@ -11,9 +11,9 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 
 ## Latest Automated Run
 
-- Run completed: 2026-03-05 IST (Asia/Kolkata)
+- Run completed: 2026-03-06 IST (Asia/Kolkata)
 - Command used: `./.venv/bin/python -m pytest -q`
-- Result: `67 passed, 2 skipped`
+- Result: `78 passed, 2 skipped`
 - Failures: none
 
 ## Recent Failure Note (2026-03-05)
@@ -78,6 +78,13 @@ The goal is not to prove identity. The goal is to make sure the experiment logs 
 3. We still do not have browser-level verification of the rendered page.
 4. Two deployment/integration tests are environment-skippable and require Docker + local socket bind permissions to run in CI.
 5. The Docker smoke coverage currently validates startup and `/events` auth but does not yet assert invitation-resource routes like `/llms.txt`, `/ai/recipe.md`, and `/banana-muffins.md` from the built image.
+
+## Residual Test Notes (Release Gate: 2026-03-06)
+
+1. We still do not have a browser-runtime test that exercises the sowblog `/agentspotter/` page against live-like `/events/public` responses (`200`, `429`, `503`) and asserts rendered UI behavior.
+2. We still do not have a single cross-repo end-to-end contract gate proving backend `/events/public` payload changes are always compatible with the sowblog renderer.
+3. Public-feed rate limiting writes to `endpoint_hits` on each request and runs cleanup churn in the hot path; this is covered functionally but not yet load-tested for SQLite lock contention behavior.
+4. `/events/public` currently enforces a key allowlist via code-level mapping and tests, but there is no framework-level typed response model to hard-fail value-shape drift.
 
 ## Post-Launch Fixes
 

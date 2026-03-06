@@ -1223,6 +1223,40 @@ def test_get_public_events_returns_allowlist_shape(database_path, monkeypatch) -
     assert isinstance(payload["has_more"], bool)
 
 
+def test_resource_counter_counts_only_banana_recipe_reads(database_path, monkeypatch) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        client.get("/llms.txt", headers={"User-Agent": "Reader/1.0"})
+        client.get("/ai/recipe.md", headers={"User-Agent": "Reader/2.0"})
+        client.get("/banana-muffins.md", headers={"User-Agent": "Reader/3.0"})
+
+        internal_response = client.get("/events", params={"limit": 20}, headers=EVENTS_AUTH_HEADER)
+        public_response = client.get("/events/public", params={"limit": 20})
+
+    assert internal_response.status_code == 200
+    assert public_response.status_code == 200
+
+    internal_payload = internal_response.json()
+    public_payload = public_response.json()
+
+    assert internal_payload["counters"]["resource"] == 1
+    assert public_payload["counters"]["resource"] == 1
+
+    internal_resource_events = [
+        event for event in internal_payload["events"] if event["event_type"] == "resource"
+    ]
+    public_resource_events = [
+        event for event in public_payload["events"] if event["event_type"] == "resource"
+    ]
+
+    assert len(internal_resource_events) == 3
+    assert len(public_resource_events) == 3
+    assert {event["path"] for event in internal_resource_events} == {
+        "/llms.txt",
+        "/ai/recipe.md",
+        "/banana-muffins.md",
+    }
+
+
 def test_get_public_events_rate_limits_independently_from_internal_events(database_path, monkeypatch) -> None:
     monkeypatch.setattr(db, "EVENTS_PUBLIC_RATE_LIMIT_PER_MINUTE", 1)
     monkeypatch.setattr(db, "EVENTS_PUBLIC_RATE_LIMIT_PER_HOUR", 20)

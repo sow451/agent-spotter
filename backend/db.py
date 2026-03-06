@@ -508,7 +508,10 @@ def list_events(
             """,
             (*params, limit),
         ).fetchall()
-        resource_count = _count_events(connection, "event_type = 'resource'")
+        resource_count = _count_events(
+            connection,
+            "event_type = 'resource' AND path = '/banana-muffins.md'",
+        )
 
     refresh = _refresh_payload(now)
     counters = {

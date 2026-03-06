@@ -1187,6 +1187,21 @@ def test_get_public_events_returns_503_when_disabled(client) -> None:
     assert response.json() == {"detail": "public events feed is disabled"}
 
 
+def test_get_public_events_includes_cors_header_for_browser_fetches(
+    database_path,
+    monkeypatch,
+) -> None:
+    with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
+        response = client.get(
+            "/events/public",
+            params={"limit": 10},
+            headers={"Origin": "https://sowrao.com"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == "*"
+
+
 def test_get_public_events_returns_allowlist_shape(database_path, monkeypatch) -> None:
     with _make_test_client(database_path, monkeypatch, events_public_enabled="true") as client:
         fetch_response = client.get("/agent.txt")

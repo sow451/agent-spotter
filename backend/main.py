@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 try:
@@ -60,6 +61,12 @@ PRODUCTION_ENV_VALUES = {"prod", "production"}
 
 def create_app() -> FastAPI:
     app = FastAPI(title="agentspotter backend")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
     app.state.database_path = _load_database_path()
     app.state.salt = _load_required_salt()

@@ -12,3 +12,4 @@
 *.db-wal
 *.sqlite
 *.sqlite-*
+output/

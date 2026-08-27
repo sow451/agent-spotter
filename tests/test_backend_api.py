@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from backend import db
 from backend.main import RECIPE_PATH, create_app
+from backend.verify_resource_tracking import build_report
 
 EVENTS_AUTH_HEADER = {"Authorization": "Bearer frontend-test-token"}
 EVENTS_RESPONSE_KEYS = {"refresh", "counters", "events", "has_more"}
@@ -87,6 +88,7 @@ def _create_compatible_schema(
     include_resource_event_type: bool = True,
     include_hi_tokens_foreign_key: bool = True,
     include_required_indexes: bool = True,
+    include_resource_reads: bool = True,
 ) -> None:
     event_type_values = "'fetch', 'hi_get', 'hi_post', 'resource'"
     if not include_resource_event_type:
@@ -167,6 +169,20 @@ def _create_compatible_schema(
         """
     )
 
+    if include_resource_reads:
+        connection.execute(
+            """
+            CREATE TABLE resource_reads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                path TEXT NOT NULL,
+                user_agent TEXT NOT NULL DEFAULT '',
+                ip_hash TEXT NOT NULL,
+                likely_crawler INTEGER NOT NULL CHECK (likely_crawler IN (0, 1))
+            )
+            """
+        )
+
     if include_required_indexes:
         connection.execute("CREATE INDEX idx_events_ts_desc ON events(ts DESC)")
         connection.execute("CREATE INDEX idx_events_event_id ON events(event_type, id DESC)")
@@ -178,6 +194,8 @@ def _create_compatible_schema(
             "CREATE INDEX idx_events_crawler_id ON events(likely_crawler, id DESC)"
         )
         connection.execute("CREATE INDEX idx_hi_tokens_expires ON hi_tokens(expires_at)")
+        if include_resource_reads:
+            connection.execute("CREATE INDEX idx_resource_reads_path_id ON resource_reads(path, id DESC)")
 
 
 def test_get_agent_txt_returns_token_and_logs_fetch(client, db_connection) -> None:
@@ -1091,10 +1109,13 @@ def test_legacy_event_type_check_uses_fallback_table_for_resource_reads(
         _create_compatible_schema(connection, include_resource_event_type=False)
         connection.commit()
 
-    with _make_test_client(database_path, monkeypatch) as client:
-        response = client.get("/llms.txt", headers={"User-Agent": "LegacyAgent/1.0"})
-
-    assert response.status_code == 200
+    context = {
+        "ts": "2026-03-31T09:25:21.206Z",
+        "ip_hash": "legacy-ip-hash",
+        "user_agent": "LegacyAgent/1.0",
+        "likely_crawler": False,
+    }
+    db.record_resource_access(str(database_path), context, path="/llms.txt")
 
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
@@ -1114,6 +1135,56 @@ def test_legacy_event_type_check_uses_fallback_table_for_resource_reads(
     assert fallback_row["path"] == "/llms.txt"
     assert fallback_row["user_agent"] == "LegacyAgent/1.0"
     assert fallback_row["likely_crawler"] == 0
+
+
+def test_startup_migrates_legacy_events_schema_and_backfills_resource_reads(
+    database_path,
+    monkeypatch,
+) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    with sqlite3.connect(database_path) as connection:
+        _create_compatible_schema(connection, include_resource_event_type=False)
+        connection.execute(
+            """
+            INSERT INTO resource_reads (ts, path, user_agent, ip_hash, likely_crawler)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("2026-03-22T04:56:25.889Z", "/llms.txt", "LegacyReader/1.0", "legacy-ip", 0),
+        )
+        connection.commit()
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        response = client.get("/events", params={"limit": 20}, headers=EVENTS_AUTH_HEADER)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["counters"]["resource"] == 1
+    assert any(event["event_type"] == "resource" and event["path"] == "/llms.txt" for event in payload["events"])
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        events_sql = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'events'
+            """
+        ).fetchone()["sql"]
+        migrated_row = connection.execute(
+            """
+            SELECT event_type, path, user_agent, source_kind, token_used
+            FROM events
+            WHERE event_type = 'resource'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    assert "'resource'" in events_sql
+    assert migrated_row["path"] == "/llms.txt"
+    assert migrated_row["user_agent"] == "LegacyReader/1.0"
+    assert migrated_row["source_kind"] == "none"
+    assert migrated_row["token_used"] == 0
 
 
 def test_get_events_validates_filters_and_preserves_fetch_rows_when_source_filtered(client) -> None:
@@ -1238,8 +1309,8 @@ def test_resource_counter_counts_only_banana_recipe_reads(database_path, monkeyp
     internal_payload = internal_response.json()
     public_payload = public_response.json()
 
-    assert internal_payload["counters"]["resource"] == 1
-    assert public_payload["counters"]["resource"] == 1
+    assert internal_payload["counters"]["resource"] == 3
+    assert public_payload["counters"]["resource"] == 3
 
     internal_resource_events = [
         event for event in internal_payload["events"] if event["event_type"] == "resource"
@@ -1255,6 +1326,250 @@ def test_resource_counter_counts_only_banana_recipe_reads(database_path, monkeyp
         "/ai/recipe.md",
         "/banana-muffins.md",
     }
+
+
+def test_get_events_uses_legacy_resource_rows_during_transition(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    with sqlite3.connect(database_path) as connection:
+        _create_compatible_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO resource_reads (ts, path, user_agent, ip_hash, likely_crawler)
+            VALUES
+                (?, ?, ?, ?, ?),
+                (?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-03-22T04:56:25.889Z",
+                "/llms.txt",
+                "LegacyReader/1.0",
+                "legacy-ip-1",
+                0,
+                "2026-03-22T04:56:23.476Z",
+                "/banana-muffins.md",
+                "LegacyReader/2.0",
+                "legacy-ip-2",
+                0,
+            ),
+        )
+        connection.commit()
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        response = client.get("/events", params={"limit": 20}, headers=EVENTS_AUTH_HEADER)
+
+    assert response.status_code == 200
+    payload = response.json()
+    resource_events = [event for event in payload["events"] if event["event_type"] == "resource"]
+    assert payload["counters"]["resource"] == 2
+    assert len(resource_events) == 2
+    assert {event["path"] for event in resource_events} == {"/llms.txt", "/banana-muffins.md"}
+
+
+def test_resource_routes_write_to_events_once_schema_supports_resource(
+    database_path,
+    monkeypatch,
+) -> None:
+    with _make_test_client(database_path, monkeypatch) as client:
+        client.get("/llms.txt", headers={"User-Agent": "Reader/1.0"})
+        client.get("/ai/recipe.md", headers={"User-Agent": "Reader/2.0"})
+        client.get("/banana-muffins.md", headers={"User-Agent": "Reader/3.0"})
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        event_rows = connection.execute(
+            """
+            SELECT event_type, path
+            FROM events
+            WHERE event_type = 'resource'
+            ORDER BY ts ASC, id ASC
+            """
+        ).fetchall()
+        fallback_count = connection.execute(
+            "SELECT COUNT(*) AS hit_count FROM resource_reads"
+        ).fetchone()["hit_count"]
+
+    assert [row["path"] for row in event_rows] == [
+        "/llms.txt",
+        "/ai/recipe.md",
+        "/banana-muffins.md",
+    ]
+    assert fallback_count == 0
+
+
+def test_backfill_legacy_resource_reads_matches_per_path_counts(database_path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        db._create_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO resource_reads (ts, path, user_agent, ip_hash, likely_crawler)
+            VALUES
+                (?, ?, ?, ?, ?),
+                (?, ?, ?, ?, ?),
+                (?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-03-22T04:56:25.889Z",
+                "/llms.txt",
+                "LegacyReader/1.0",
+                "legacy-ip-1",
+                0,
+                "2026-03-22T04:56:23.476Z",
+                "/banana-muffins.md",
+                "LegacyReader/2.0",
+                "legacy-ip-2",
+                1,
+                "2026-03-22T04:56:24.000Z",
+                "/banana-muffins.md",
+                "LegacyReader/3.0",
+                "legacy-ip-3",
+                0,
+            ),
+        )
+
+        inserted = db._backfill_legacy_resource_reads(connection)
+
+        per_path_rows = connection.execute(
+            """
+            SELECT path, COUNT(*) AS hit_count
+            FROM events
+            WHERE event_type = 'resource'
+            GROUP BY path
+            ORDER BY path
+            """
+        ).fetchall()
+
+    assert inserted == 3
+    assert {row["path"]: row["hit_count"] for row in per_path_rows} == {
+        "/banana-muffins.md": 2,
+        "/llms.txt": 1,
+    }
+
+
+def test_backfill_only_inserts_legacy_rows_missing_from_events(database_path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        db._create_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO events (
+                ts,
+                event_type,
+                path,
+                agent_name,
+                message,
+                source_kind,
+                user_agent,
+                ip_hash,
+                likely_crawler,
+                token_used
+            ) VALUES (?, 'resource', ?, NULL, NULL, 'none', ?, ?, ?, 0)
+            """,
+            ("2026-03-22T04:56:25.889Z", "/llms.txt", "LegacyReader/1.0", "legacy-ip-1", 0),
+        )
+        connection.execute(
+            """
+            INSERT INTO resource_reads (ts, path, user_agent, ip_hash, likely_crawler)
+            VALUES
+                (?, ?, ?, ?, ?),
+                (?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-03-22T04:56:25.889Z",
+                "/llms.txt",
+                "LegacyReader/1.0",
+                "legacy-ip-1",
+                0,
+                "2026-03-22T04:56:23.476Z",
+                "/banana-muffins.md",
+                "LegacyReader/2.0",
+                "legacy-ip-2",
+                0,
+            ),
+        )
+
+        inserted = db._backfill_legacy_resource_reads(connection)
+        resource_event_count = connection.execute(
+            "SELECT COUNT(*) AS hit_count FROM events WHERE event_type = 'resource'"
+        ).fetchone()["hit_count"]
+
+    assert inserted == 1
+    assert resource_event_count == 2
+
+
+def test_backfill_legacy_resource_reads_is_idempotent(database_path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        db._create_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO resource_reads (ts, path, user_agent, ip_hash, likely_crawler)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("2026-03-22T04:56:25.889Z", "/llms.txt", "LegacyReader/1.0", "legacy-ip", 0),
+        )
+
+        first_inserted = db._backfill_legacy_resource_reads(connection)
+        second_inserted = db._backfill_legacy_resource_reads(connection)
+        resource_event_count = connection.execute(
+            "SELECT COUNT(*) AS hit_count FROM events WHERE event_type = 'resource'"
+        ).fetchone()["hit_count"]
+
+    assert first_inserted == 1
+    assert second_inserted == 0
+    assert resource_event_count == 1
+
+
+def test_verify_resource_tracking_report_compares_events_and_legacy_tables(database_path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        db._create_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO events (
+                ts,
+                event_type,
+                path,
+                agent_name,
+                message,
+                source_kind,
+                user_agent,
+                ip_hash,
+                likely_crawler,
+                token_used
+            ) VALUES (?, 'resource', ?, NULL, NULL, 'none', ?, ?, ?, 0)
+            """,
+            ("2026-03-22T04:56:25.889Z", "/llms.txt", "Reader/1.0", "ip-1", 0),
+        )
+        connection.execute(
+            """
+            INSERT INTO resource_reads (ts, path, user_agent, ip_hash, likely_crawler)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("2026-03-22T04:56:23.476Z", "/banana-muffins.md", "Reader/2.0", "ip-2", 1),
+        )
+        connection.commit()
+
+    report = build_report(database_path)
+
+    assert report["resource_reads_total"] == 1
+    assert report["events_resource_total"] == 1
+    assert report["paths"] == [
+        {
+            "path": "/llms.txt",
+            "events_resource_count": 1,
+            "resource_reads_count": 0,
+        },
+        {
+            "path": "/ai/recipe.md",
+            "events_resource_count": 0,
+            "resource_reads_count": 0,
+        },
+        {
+            "path": "/banana-muffins.md",
+            "events_resource_count": 0,
+            "resource_reads_count": 1,
+        },
+    ]
 
 
 def test_get_public_events_rate_limits_independently_from_internal_events(database_path, monkeypatch) -> None:

@@ -105,6 +105,8 @@ def initialize_database(database_path: str) -> None:
         connection.execute("PRAGMA busy_timeout=5000")
         _ensure_schema_compatible_or_empty(connection)
         _create_schema(connection)
+        _migrate_events_table_for_resource_support(connection)
+        _backfill_legacy_resource_reads(connection)
         _cleanup_expired_tokens(connection, utc_now())
         _ensure_cache_row(connection)
         rebuild_stats_cache(connection)
@@ -468,8 +470,26 @@ def list_events(
             conditions.append("likely_crawler = 0")
 
         if before_id is not None:
-            conditions.append("id < ?")
-            params.append(before_id)
+            reference_row = connection.execute(
+                """
+                SELECT ts, id
+                FROM events
+                WHERE id = ?
+                """,
+                (before_id,),
+            ).fetchone()
+            if reference_row is not None:
+                conditions.append("(ts < ? OR (ts = ? AND id < ?))")
+                params.extend(
+                    [
+                        reference_row["ts"],
+                        reference_row["ts"],
+                        int(reference_row["id"]),
+                    ]
+                )
+            else:
+                conditions.append("id < ?")
+                params.append(before_id)
 
         if q:
             conditions.append(
@@ -503,15 +523,12 @@ def list_events(
                 token_used
             FROM events
             {where_clause}
-            ORDER BY id DESC
+            ORDER BY ts DESC, id DESC
             LIMIT ?
             """,
             (*params, limit),
         ).fetchall()
-        resource_count = _count_events(
-            connection,
-            "event_type = 'resource' AND path = '/banana-muffins.md'",
-        )
+        resource_count = _count_resource_rows(connection)
 
     refresh = _refresh_payload(now)
     counters = {
@@ -917,6 +934,128 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_events_table_for_resource_support(connection: sqlite3.Connection) -> None:
+    if _events_table_supports_resource(connection):
+        return
+
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE events__migrated (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK (event_type IN ('fetch', 'hi_get', 'hi_post', 'resource')),
+                path TEXT NOT NULL,
+                agent_name TEXT,
+                message TEXT,
+                source_kind TEXT NOT NULL CHECK (source_kind IN ('none', 'unknown', 'manual', 'agent')),
+                user_agent TEXT NOT NULL DEFAULT '',
+                ip_hash TEXT NOT NULL,
+                likely_crawler INTEGER NOT NULL CHECK (likely_crawler IN (0, 1)),
+                token_used INTEGER NOT NULL CHECK (token_used IN (0, 1))
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO events__migrated (
+                id,
+                ts,
+                event_type,
+                path,
+                agent_name,
+                message,
+                source_kind,
+                user_agent,
+                ip_hash,
+                likely_crawler,
+                token_used
+            )
+            SELECT
+                id,
+                ts,
+                event_type,
+                path,
+                agent_name,
+                message,
+                source_kind,
+                user_agent,
+                ip_hash,
+                likely_crawler,
+                token_used
+            FROM events
+            ORDER BY id ASC
+            """
+        )
+        connection.execute("DROP TABLE events")
+        connection.execute("ALTER TABLE events__migrated RENAME TO events")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_desc ON events(ts DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_events_event_id ON events(event_type, id DESC)")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_ip_event_ts ON events(ip_hash, event_type, ts DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_source_id ON events(source_kind, id DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_crawler_id ON events(likely_crawler, id DESC)"
+        )
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_key_issues:
+        raise _schema_error("events migration introduced foreign key issues")
+
+
+def _backfill_legacy_resource_reads(connection: sqlite3.Connection) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO events (
+            ts,
+            event_type,
+            path,
+            agent_name,
+            message,
+            source_kind,
+            user_agent,
+            ip_hash,
+            likely_crawler,
+            token_used
+        )
+        SELECT
+            rr.ts,
+            'resource',
+            rr.path,
+            NULL,
+            NULL,
+            'none',
+            rr.user_agent,
+            rr.ip_hash,
+            rr.likely_crawler,
+            0
+        FROM resource_reads AS rr
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM events AS e
+            WHERE e.event_type = 'resource'
+              AND e.ts = rr.ts
+              AND e.path = rr.path
+              AND COALESCE(e.agent_name, '') = ''
+              AND COALESCE(e.message, '') = ''
+              AND e.source_kind = 'none'
+              AND e.user_agent = rr.user_agent
+              AND e.ip_hash = rr.ip_hash
+              AND e.likely_crawler = rr.likely_crawler
+              AND e.token_used = 0
+        )
+        ORDER BY rr.id ASC
+        """
+    )
+    return int(cursor.rowcount if cursor.rowcount is not None else 0)
+
+
 def _ensure_schema_compatible_or_empty(connection: sqlite3.Connection) -> None:
     existing_rows = connection.execute(
         """
@@ -1161,6 +1300,16 @@ def _validate_events_event_type_check(connection: sqlite3.Connection) -> None:
     }
     if not any(fragment in normalized_sql for fragment in normalized_allowed):
         raise _schema_error("events missing required event_type CHECK constraint")
+
+
+def _events_table_supports_resource(connection: sqlite3.Connection) -> bool:
+    normalized_sql = _normalized_create_sql(connection, "events")
+    if not normalized_sql:
+        return False
+    normalized_fragment = _normalize_sql(
+        "check (event_type in ('fetch', 'hi_get', 'hi_post', 'resource'))"
+    )
+    return normalized_fragment in normalized_sql
 
 
 def _is_legacy_event_type_check_error(exc: sqlite3.IntegrityError) -> bool:
@@ -1578,6 +1727,33 @@ def _rebuild_source_windows_for_day(connection: sqlite3.Connection, window_day: 
 def _count_events(connection: sqlite3.Connection, where_clause: str) -> int:
     query = f"SELECT COUNT(*) AS hit_count FROM events WHERE {where_clause}"
     return int(connection.execute(query).fetchone()["hit_count"])
+
+
+def _count_resource_rows(connection: sqlite3.Connection) -> int:
+    resource_events = _count_events(connection, "event_type = 'resource'")
+    legacy_only_resource_rows = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS hit_count
+            FROM resource_reads AS rr
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM events AS e
+                WHERE e.event_type = 'resource'
+                  AND e.ts = rr.ts
+                  AND e.path = rr.path
+                  AND COALESCE(e.agent_name, '') = ''
+                  AND COALESCE(e.message, '') = ''
+                  AND e.source_kind = 'none'
+                  AND e.user_agent = rr.user_agent
+                  AND e.ip_hash = rr.ip_hash
+                  AND e.likely_crawler = rr.likely_crawler
+                  AND e.token_used = 0
+            )
+            """
+        ).fetchone()["hit_count"]
+    )
+    return resource_events + legacy_only_resource_rows
 
 
 def _count_distinct_ip_for_day(

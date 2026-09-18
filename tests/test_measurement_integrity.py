@@ -257,8 +257,12 @@ def test_historical_rows_are_classified_on_startup(database_path, monkeypatch) -
 
 
 def test_robots_and_sitemap_publish_the_invitation_and_record_nothing(client) -> None:
-    robots = client.get("/robots.txt")
-    sitemap = client.get("/sitemap.xml")
+    robots = client.get(
+        "/robots.txt", headers={"X-Forwarded-Proto": "https", "Host": "agentspotter.test"}
+    )
+    sitemap = client.get(
+        "/sitemap.xml", headers={"X-Forwarded-Proto": "https", "Host": "agentspotter.test"}
+    )
     payload = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER).json()
 
     assert robots.status_code == 200
@@ -268,6 +272,10 @@ def test_robots_and_sitemap_publish_the_invitation_and_record_nothing(client) ->
         assert path in robots.text
         assert path in sitemap.text
     assert "<urlset" in sitemap.text
+    # crawler-facing documents must advertise the scheme the client actually uses
+    assert "https://agentspotter.test/llms.txt" in robots.text
+    assert "https://agentspotter.test/agent.txt" in sitemap.text
+    assert "http://agentspotter.test" not in robots.text
 
     counters = payload["counters"]
     assert counters["resource"] == 0

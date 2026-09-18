@@ -184,6 +184,7 @@ def initialize_database(database_path: str) -> None:
         _create_schema(connection)
         _migrate_events_table_for_resource_support(connection)
         _ensure_events_ua_family_column(connection)
+        _backfill_ua_families(connection)
         _backfill_legacy_resource_reads(connection)
         _cleanup_expired_tokens(connection, utc_now())
         _ensure_cache_row(connection)
@@ -1152,6 +1153,35 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_resource_reads_path_id ON resource_reads(path, id DESC)"
     )
+
+
+def _backfill_ua_families(connection: sqlite3.Connection) -> int:
+    """Classify stored user agents for rows written before ua_family existed.
+
+    Idempotent: only rows with an empty family are touched, so historical traffic
+    stops being counted as unknown/unlabelled in the published ratios. The mapping
+    follows the same rules (and the same SELF_TEST_UA_MARKERS setting) as ingest.
+    """
+
+    pending = connection.execute(
+        "SELECT id, user_agent FROM events WHERE ua_family = ''"
+    ).fetchall()
+    if pending:
+        connection.executemany(
+            "UPDATE events SET ua_family = ? WHERE id = ?",
+            ((classify_user_agent(row["user_agent"]), row["id"]) for row in pending),
+        )
+
+    pending_rejected = connection.execute(
+        "SELECT id, user_agent FROM rejected_tokens WHERE ua_family = ''"
+    ).fetchall()
+    if pending_rejected:
+        connection.executemany(
+            "UPDATE rejected_tokens SET ua_family = ? WHERE id = ?",
+            ((classify_user_agent(row["user_agent"]), row["id"]) for row in pending_rejected),
+        )
+
+    return len(pending) + len(pending_rejected)
 
 
 def _ensure_events_ua_family_column(connection: sqlite3.Connection) -> None:

@@ -9,6 +9,14 @@ The docs are split by purpose so it is easy to navigate: `context.md` explains w
 - `plan.md` = aligned execution plan / what
 - `copy.md` = website copy
 
+## Discovery front door
+
+The backend publishes its own machine-readable entry points and records nothing for them:
+
+- `GET /robots.txt` points crawlers at `/llms.txt`, `/ai/recipe.md`, `/banana-muffins.md`, `/agent.txt` and `/hi`, and advertises the sitemap
+- `GET /sitemap.xml` lists the same five read paths
+- Both are non-mutating, like `GET /health`
+
 ## Railway backend deployment
 
 The FastAPI backend can now be deployed to Railway directly from the repo root with the included `Dockerfile`. This avoids Railway picking up the separately deployed Streamlit frontend dependencies by mistake.

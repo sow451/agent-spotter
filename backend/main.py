@@ -96,6 +96,39 @@ def create_app() -> FastAPI:
             raise
         return PlainTextResponse(response_text, media_type="text/plain")
 
+    @app.get("/robots.txt")
+    async def get_robots_txt(request: Request) -> PlainTextResponse:
+        base_url = str(request.base_url).rstrip("/")
+        lines = [
+            "User-agent: *",
+            "Allow: /",
+            "",
+            "# A small public experiment on whether instruction-following agents",
+            "# follow through. Machine-readable entry points:",
+            f"#   {base_url}/llms.txt          invitation and instructions",
+            f"#   {base_url}/ai/recipe.md      recipe flow",
+            f"#   {base_url}/banana-muffins.md full recipe",
+            f"#   {base_url}/agent.txt         experiment instructions (issues an optional token)",
+            f"#   {base_url}/hi                follow-through signal (GET or POST)",
+            "",
+            f"Sitemap: {base_url}/sitemap.xml",
+            "",
+        ]
+        return PlainTextResponse("\n".join(lines), media_type="text/plain")
+
+    @app.get("/sitemap.xml")
+    async def get_sitemap(request: Request) -> PlainTextResponse:
+        base_url = str(request.base_url).rstrip("/")
+        paths = ("/llms.txt", "/ai/recipe.md", "/banana-muffins.md", "/agent.txt", "/hi")
+        entries = "".join(f"  <url><loc>{base_url}{path}</loc></url>\n" for path in paths)
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+            f"{entries}"
+            "</urlset>\n"
+        )
+        return PlainTextResponse(body, media_type="application/xml")
+
     @app.get("/health")
     async def get_health() -> JSONResponse:
         return JSONResponse({"status": "ok"})

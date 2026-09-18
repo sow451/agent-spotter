@@ -98,7 +98,7 @@ def create_app() -> FastAPI:
 
     @app.get("/robots.txt")
     async def get_robots_txt(request: Request) -> PlainTextResponse:
-        base_url = str(request.base_url).rstrip("/")
+        base_url = _public_base_url(request)
         lines = [
             "User-agent: *",
             "Allow: /",
@@ -118,7 +118,7 @@ def create_app() -> FastAPI:
 
     @app.get("/sitemap.xml")
     async def get_sitemap(request: Request) -> PlainTextResponse:
-        base_url = str(request.base_url).rstrip("/")
+        base_url = _public_base_url(request)
         paths = ("/llms.txt", "/ai/recipe.md", "/banana-muffins.md", "/agent.txt", "/hi")
         entries = "".join(f"  <url><loc>{base_url}{path}</loc></url>\n" for path in paths)
         body = (
@@ -331,6 +331,19 @@ def create_app() -> FastAPI:
         return JSONResponse(_public_events_payload(payload))
 
     return app
+
+
+def _public_base_url(request: Request) -> str:
+    """Absolute base URL for crawler-facing documents.
+
+    Railway terminates TLS and the app sees plain http, so the forwarded proto is
+    what the crawler will actually use; fall back to the request scheme locally.
+    """
+
+    forwarded_proto = (request.headers.get("x-forwarded-proto", "") or "").split(",")[0].strip().lower()
+    scheme = forwarded_proto if forwarded_proto in {"http", "https"} else request.url.scheme
+    host = request.headers.get("host") or request.url.netloc
+    return f"{scheme}://{host}".rstrip("/")
 
 
 def _env_flag(raw_value: str) -> bool:

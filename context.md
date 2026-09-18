@@ -105,7 +105,7 @@ Caller discovers the site
           +--> server returns:
           |      - recipe
           |      - one-time token (optional to use)
-          |      - token valid for 1 minute
+          |      - token valid for 10 minutes
           |      - clear instructions for GET /hi and POST /hi
           |
           v
@@ -201,6 +201,13 @@ For `POST /hi`, the response also includes `token_status`:
 ### Privacy
 
 - We collect a salted IP hash for approximate repeat-source detection
+
+### Traffic labelling
+
+- Every event stores a `ua_family` (googlebot, googleother, claude-user, meta-externalagent, curl, browser, ...)
+- Self-test traffic (default marker: `curl/`, configurable via `SELF_TEST_UA_MARKERS`) is counted as `manual`, never as an agent signal
+- Headline ratios exclude self-test traffic and say so via `ratio_basis`
+- A `POST /hi` that presents an expired or already-used token is recorded as `hi_post_expired`: a near miss, not a follow-through
 
 ### Success Criteria
 

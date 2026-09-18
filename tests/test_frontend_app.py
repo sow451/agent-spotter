@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
+
 import pytest
 
 from streamlit.testing.v1 import AppTest
@@ -106,7 +108,8 @@ def test_frontend_runs_with_real_streamlit_testing_and_handles_backend_failure(m
     monkeypatch.setenv("BACKEND_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("FRONTEND_API_TOKEN", "frontend-test-token")
 
-    app_test = AppTest.from_file("frontend/app.py").run(timeout=20)
+    app_path = Path(__file__).resolve().parents[1] / "frontend" / "app.py"
+    app_test = AppTest.from_file(str(app_path)).run(timeout=20)
 
     assert len(app_test.exception) == 0
     assert len(app_test.error) == 1

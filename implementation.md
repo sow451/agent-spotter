@@ -751,6 +751,7 @@ Rules:
 - `ratio_unknown = hi_unknown / fetch`, else `0.0`
 - Both headline ratios are computed **excluding self-test traffic** and report `ratio_basis = "excluding_self_test"`; `fetch_excluding_self_test` and `hi_total_excluding_self_test` expose the basis, `self_test_events` counts the excluded rows
 - `hi_post_expired` counts token-bearing `POST /hi` attempts that arrived with an expired or already-used token (recorded in `rejected_tokens`, never inside the `hi_*` counters)
+- Rows written before `ua_family` existed are classified once at startup from their stored user agent, so historical traffic is labelled too
 - Every event and every public event row carries `ua_family` (for example `googlebot`, `googleother`, `claude-user`, `meta-externalagent`, `curl`, `browser`)
 - `hi_total = hi_get + hi_post + hi_post_token`
 - `has_more` is `true` when the current page is full and older matching rows may still exist

@@ -211,3 +211,66 @@ def test_legacy_database_gains_ua_family_column_on_startup(database_path, monkey
     assert "ua_family" in columns_after
     assert resource_row["ua_family"] == "googleother"
     assert payload["counters"]["resource"] == 1
+
+def test_historical_rows_are_classified_on_startup(database_path, monkeypatch) -> None:
+    _clear_managed_runtime_markers(monkeypatch)
+    with sqlite3.connect(database_path) as connection:
+        _create_compatible_schema(connection)
+        connection.executemany(
+            """
+            INSERT INTO events (
+                ts, event_type, path, agent_name, message, source_kind,
+                user_agent, ip_hash, likely_crawler, token_used
+            ) VALUES (?, ?, ?, NULL, NULL, 'none', ?, ?, 0, 0)
+            """,
+            (
+                ("2026-03-05T10:00:00.000Z", "fetch", "/agent.txt", CURL_UA, "old-ip-1"),
+                ("2026-03-05T10:01:00.000Z", "fetch", "/agent.txt", BROWSER_UA, "old-ip-2"),
+                ("2026-03-05T10:02:00.000Z", "hi_get", "/hi", CURL_UA, "old-ip-1"),
+                ("2026-03-05T10:03:00.000Z", "hi_get", "/hi", BROWSER_UA, "old-ip-2"),
+            ),
+        )
+        connection.commit()
+
+    with _make_test_client(database_path, monkeypatch) as client:
+        payload = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER).json()
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        families = {
+            row["id"]: row["ua_family"]
+            for row in connection.execute("SELECT id, ua_family FROM events ORDER BY id").fetchall()
+        }
+
+    assert sorted(families.values()) == [
+        db.BROWSER_UA_FAMILY,
+        db.BROWSER_UA_FAMILY,
+        db.SELF_TEST_UA_FAMILY,
+        db.SELF_TEST_UA_FAMILY,
+    ]
+
+    counters = payload["counters"]
+    assert counters["self_test_events"] == 2
+    assert counters["fetch_excluding_self_test"] == 1
+    assert counters["hi_total_excluding_self_test"] == 1
+    assert counters["ratio_total"] == 1.0
+
+
+def test_robots_and_sitemap_publish_the_invitation_and_record_nothing(client) -> None:
+    robots = client.get("/robots.txt")
+    sitemap = client.get("/sitemap.xml")
+    payload = client.get("/events", params={"limit": 10}, headers=EVENTS_AUTH_HEADER).json()
+
+    assert robots.status_code == 200
+    assert sitemap.status_code == 200
+    assert "text/plain" in robots.headers["content-type"]
+    for path in ("/llms.txt", "/ai/recipe.md", "/banana-muffins.md", "/agent.txt", "/hi"):
+        assert path in robots.text
+        assert path in sitemap.text
+    assert "<urlset" in sitemap.text
+
+    counters = payload["counters"]
+    assert counters["resource"] == 0
+    assert counters["fetch"] == 0
+    assert counters["hi_total"] == 0
+    assert payload["events"] == []

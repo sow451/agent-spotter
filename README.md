@@ -22,7 +22,9 @@ Use these settings when you create the Railway service:
 Set these required environment variables in Railway before the service starts:
 
 - `SALT`: any strong, unique secret string
-- `TRUST_PROXY_HEADERS`: set to `false` by default; only set it to `true` if you have explicitly verified Railway overwrites and sanitizes `X-Forwarded-For`
+- `TRUST_PROXY_HEADERS`: `true` is required for per-source measurement on Railway. Server-side, the first `X-Forwarded-For` hop is used (the Railway edge appends the real client, so client-supplied prefixes are the residual spoofing risk), falling back to `X-Real-IP` and finally the socket peer. With it `false`, every visitor collapses into one hash: `*_unique_utc_day` counters stay at 1 and the per-IP rate limits become global. Verify after any change: send traffic from two different networks and confirm `fetch_unique_utc_day` rises above 1.
+- `TOKEN_TTL_SECONDS`: optional, default `600`.
+- `SELF_TEST_UA_MARKERS`: optional, comma-separated user-agent substrings counted as `manual` self-test traffic, default `curl/`.
 - `FRONTEND_API_TOKEN`: a shared bearer token the Streamlit frontend uses when calling `/events`
 
 Required for durable data:

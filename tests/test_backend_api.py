@@ -12,7 +12,7 @@ from backend.verify_resource_tracking import build_report
 
 EVENTS_AUTH_HEADER = {"Authorization": "Bearer frontend-test-token"}
 EVENTS_RESPONSE_KEYS = {"refresh", "counters", "events", "has_more"}
-PUBLIC_EVENT_KEYS = {"id", "ts", "event_type", "path", "source_kind", "token_used"}
+PUBLIC_EVENT_KEYS = {"id", "ts", "event_type", "path", "source_kind", "token_used", "ua_family"}
 PUBLIC_REFRESH_KEYS = {"cadence_seconds", "cadence_minutes", "last_refreshed_at", "next_refresh_at"}
 PUBLIC_COUNTER_KEYS = {
     "resource",
@@ -29,6 +29,11 @@ PUBLIC_COUNTER_KEYS = {
     "hi_post_token_unique_utc_day",
     "ratio_total",
     "ratio_unknown",
+    "ratio_basis",
+    "hi_post_expired",
+    "self_test_events",
+    "fetch_excluding_self_test",
+    "hi_total_excluding_self_test",
 }
 INTERNAL_EVENT_KEYS = {
     "id",
@@ -41,6 +46,7 @@ INTERNAL_EVENT_KEYS = {
     "user_agent",
     "likely_crawler",
     "token_used",
+    "ua_family",
 }
 
 
@@ -516,16 +522,17 @@ def test_invalid_token_returns_400_without_writing_events_or_counters(client, db
     client.get("/agent.txt")
 
     response = client.post(
-        "/hi",
-        json={"agent_name": "Scout", "token": "not-a-real-token"},
-    )
+            "/hi",
+            json={"agent_name": "Scout", "token": "not-a-real-token"},
+        )
 
     assert response.status_code == 400
-    assert response.json() == {
-        "status": "invalid_token",
-        "token_status": "invalid_or_expired",
-        "detail": "Token invalid or expired. Fetch /agent.txt again for a fresh token.",
-    }
+    data = response.json()
+    assert data["status"] == "invalid_token"
+    assert data["token_status"] == "invalid_or_expired"
+    assert data["detail"] == "Token invalid or expired. Fetch /agent.txt again for a fresh token."
+    assert data["signal"] == "hi_post_expired"
+    assert data["hi_post_expired"] == 1
 
     hi_rows = db_connection.execute(
         "SELECT COUNT(*) AS hit_count FROM events WHERE event_type IN ('hi_get', 'hi_post')"
@@ -570,7 +577,7 @@ def test_token_expires_at_boundary(database_path, monkeypatch) -> None:
     with _make_test_client(database_path, monkeypatch) as client:
         fetch_response = client.get("/agent.txt")
         token = _extract_token(fetch_response.text)
-        current_time["value"] = base_time + timedelta(seconds=60)
+        current_time["value"] = base_time + timedelta(seconds=db.TOKEN_TTL_SECONDS)
         expired = client.post("/hi", json={"agent_name": "Scout", "token": token})
 
     assert expired.status_code == 400
@@ -870,7 +877,7 @@ def test_fetch_path_cleans_up_expired_tokens(database_path, monkeypatch) -> None
         first_fetch = client.get("/agent.txt")
         first_token = _extract_token(first_fetch.text)
 
-        current_time["value"] = base_time + timedelta(seconds=61)
+        current_time["value"] = base_time + timedelta(seconds=db.TOKEN_TTL_SECONDS + 1)
         second_fetch = client.get("/agent.txt")
         second_token = _extract_token(second_fetch.text)
 
@@ -925,8 +932,10 @@ def test_get_events_exposes_revised_counters_and_hides_private_fields(client) ->
     assert payload["counters"]["hi_unknown"] == 1
     assert payload["counters"]["hi_manual"] == 1
     assert payload["counters"]["hi_agent"] == 1
-    assert payload["counters"]["ratio_total"] == 0.3333
+    assert payload["counters"]["ratio_total"] == 0.5
     assert payload["counters"]["ratio_unknown"] == 1.0
+    assert payload["counters"]["self_test_events"] == 1
+    assert payload["counters"]["ratio_basis"] == "excluding_self_test"
 
     events = payload["events"]
     assert len(events) == 1

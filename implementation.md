@@ -242,7 +242,7 @@ Columns:
 
 Rules:
 
-- token lifetime is exactly 60 seconds from issuance
+- token lifetime is exactly 10 minutes (600 seconds) from issuance, configurable via `TOKEN_TTL_SECONDS`
 - the token is a bearer token in MVP
 - token is optional to use
 - token is single-use
@@ -409,7 +409,7 @@ GET /agent.txt
 ### Behavior
 
 - log one `fetch` event
-- issue one token valid for 60 seconds
+- issue one token valid for 600 seconds (configurable)
 - store the token in `hi_tokens`
 - return plain text
 - apply per-IP abuse controls:
@@ -749,6 +749,9 @@ Rules:
 - do not recompute full-table aggregates on every request
 - `ratio_total = fetch / hi_total`, else `0.0`
 - `ratio_unknown = hi_unknown / fetch`, else `0.0`
+- Both headline ratios are computed **excluding self-test traffic** and report `ratio_basis = "excluding_self_test"`; `fetch_excluding_self_test` and `hi_total_excluding_self_test` expose the basis, `self_test_events` counts the excluded rows
+- `hi_post_expired` counts token-bearing `POST /hi` attempts that arrived with an expired or already-used token (recorded in `rejected_tokens`, never inside the `hi_*` counters)
+- Every event and every public event row carries `ua_family` (for example `googlebot`, `googleother`, `claude-user`, `meta-externalagent`, `curl`, `browser`)
 - `hi_total = hi_get + hi_post + hi_post_token`
 - `has_more` is `true` when the current page is full and older matching rows may still exist
 - `GET /events` may trigger a cache-window refresh on first read after a UTC day rollover so the public counters stay current

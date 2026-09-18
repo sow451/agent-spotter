@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
 ALLOWED_SOURCE_KINDS = {"none", "unknown", "manual", "agent"}
 ALLOWED_EVENT_TYPES = {"fetch", "hi_get", "hi_post", "resource"}
 EVENTS_REFRESH_CADENCE_SECONDS = 600
-TOKEN_TTL_SECONDS = 60
+TOKEN_TTL_SECONDS = _env_positive_int("TOKEN_TTL_SECONDS", 600)
 FETCH_RATE_LIMIT_PER_MINUTE = 60
 FETCH_RATE_LIMIT_PER_HOUR = 600
 HI_GET_RATE_LIMIT_PER_MINUTE = 20
@@ -42,10 +54,75 @@ CRAWLER_MARKERS = (
     "spider",
     "slurp",
     "headless",
-    "gptbot",
-    "claudebot",
-    "bytespider",
-    "facebookexternalhit",
+)
+
+SELF_TEST_UA_FAMILY = "self_test"
+GENERIC_CRAWLER_FAMILY = "generic_bot"
+BROWSER_UA_FAMILY = "browser"
+UNKNOWN_UA_FAMILY = "unknown"
+
+UA_FAMILY_RULES = (
+    ("meta_externalagent", ("meta-externalagent", "facebookexternalhit", "meta-webindexer")),
+    ("claudebot", ("claudebot", "anthropic-ai", "claude-web")),
+    ("claude_user", ("claude-user",)),
+    ("gptbot", ("gptbot", "oai-searchbot", "openai")),
+    ("chatgpt_user", ("chatgpt-user",)),
+    ("perplexity", ("perplexitybot", "perplexity-user")),
+    ("googleother", ("googleother",)),
+    (
+        "googlebot",
+        (
+            "googlebot",
+            "google-extended",
+            "google-inspectiontool",
+            "storebot-google",
+            "mediapartners-google",
+            "apis-google",
+        ),
+    ),
+    ("applebot", ("applebot",)),
+    ("bytespider", ("bytespider",)),
+    ("ccbot", ("ccbot",)),
+    ("amazonbot", ("amazonbot",)),
+    ("bingbot", ("bingbot", "msnbot")),
+    ("duckduckbot", ("duckduckbot", "duckassistbot")),
+    ("yandexbot", ("yandexbot", "yandeximages")),
+    ("baiduspider", ("baiduspider",)),
+    ("seo_crawler", ("ahrefsbot", "semrushbot", "mj12bot", "dotbot", "petalbot")),
+    ("python_client", ("python-requests", "python-urllib", "httpx", "aiohttp", "urllib3")),
+    ("curl", ("curl/",)),
+    ("wget", ("wget",)),
+    ("go_http_client", ("go-http-client",)),
+)
+
+# Passive/automated fetchers for the crawler filter. User-triggered assistant
+# fetchers (Claude-User, ChatGPT-User, Perplexity-User) are deliberately excluded
+# so they stay visible as the interactive class the experiment is looking for.
+CRAWLER_UA_FAMILIES = frozenset(
+    {
+        "meta_externalagent",
+        "claudebot",
+        "gptbot",
+        "perplexity",
+        "googleother",
+        "googlebot",
+        "applebot",
+        "bytespider",
+        "ccbot",
+        "amazonbot",
+        "bingbot",
+        "duckduckbot",
+        "yandexbot",
+        "baiduspider",
+        "seo_crawler",
+        GENERIC_CRAWLER_FAMILY,
+    }
+)
+
+SELF_TEST_UA_MARKERS = tuple(
+    marker.strip().lower()
+    for marker in os.getenv("SELF_TEST_UA_MARKERS", "curl/").split(",")
+    if marker.strip()
 )
 
 
@@ -106,6 +183,7 @@ def initialize_database(database_path: str) -> None:
         _ensure_schema_compatible_or_empty(connection)
         _create_schema(connection)
         _migrate_events_table_for_resource_support(connection)
+        _ensure_events_ua_family_column(connection)
         _backfill_legacy_resource_reads(connection)
         _cleanup_expired_tokens(connection, utc_now())
         _ensure_cache_row(connection)
@@ -116,9 +194,15 @@ def extract_client_ip(request: Any, trust_proxy_headers: bool) -> str:
     if trust_proxy_headers:
         forwarded_for = request.headers.get("x-forwarded-for", "")
         if forwarded_for:
-            first_hop = forwarded_for.split(",")[0].strip()
-            if first_hop:
-                return first_hop
+            # The edge proxy controls this header and the real client is the first
+            # hop; any client-supplied prefix is the residual spoofing risk.
+            for hop in forwarded_for.split(","):
+                first_hop = hop.strip()
+                if first_hop:
+                    return first_hop
+        real_ip = (request.headers.get("x-real-ip", "") or "").strip()
+        if real_ip:
+            return real_ip
 
     client = getattr(request, "client", None)
     host = getattr(client, "host", None)
@@ -129,9 +213,22 @@ def hash_ip(ip_address: str, salt: str) -> str:
     return hashlib.sha256(f"{ip_address}{salt}".encode("utf-8")).hexdigest()
 
 
+def classify_user_agent(user_agent: str) -> str:
+    lowered = (user_agent or "").lower()
+    if any(marker in lowered for marker in SELF_TEST_UA_MARKERS):
+        return SELF_TEST_UA_FAMILY
+    for family, markers in UA_FAMILY_RULES:
+        if any(marker in lowered for marker in markers):
+            return family
+    if any(marker in lowered for marker in CRAWLER_MARKERS):
+        return GENERIC_CRAWLER_FAMILY
+    if "mozilla/" in lowered:
+        return BROWSER_UA_FAMILY
+    return UNKNOWN_UA_FAMILY
+
+
 def detect_likely_crawler(user_agent: str) -> bool:
-    lowered = user_agent.lower()
-    return any(marker in lowered for marker in CRAWLER_MARKERS)
+    return classify_user_agent(user_agent) in CRAWLER_UA_FAMILIES
 
 
 def build_request_context(request: Any, salt: str, trust_proxy_headers: bool) -> dict[str, Any]:
@@ -139,13 +236,15 @@ def build_request_context(request: Any, salt: str, trust_proxy_headers: bool) ->
     timestamp = utc_timestamp(now)
     ip_address = extract_client_ip(request, trust_proxy_headers)
     user_agent = request.headers.get("user-agent", "")
+    ua_family = classify_user_agent(user_agent)
     return {
         "now": now,
         "ts": timestamp,
         "window_day": utc_day(now),
         "ip_hash": hash_ip(ip_address, salt),
         "user_agent": user_agent,
-        "likely_crawler": detect_likely_crawler(user_agent),
+        "ua_family": ua_family,
+        "likely_crawler": ua_family in CRAWLER_UA_FAMILIES,
     }
 
 
@@ -231,6 +330,41 @@ def record_fetch(database_path: str, context: dict[str, Any]) -> None:
     record_fetch_and_issue_token(database_path, context)
 
 
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _insert_legacy_resource_read(
+    connection: sqlite3.Connection,
+    context: dict[str, Any],
+    path: str,
+) -> None:
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        """
+        INSERT INTO resource_reads (
+            ts,
+            path,
+            user_agent,
+            ip_hash,
+            likely_crawler
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            context["ts"],
+            path,
+            context["user_agent"],
+            context["ip_hash"],
+            int(context["likely_crawler"]),
+        ),
+    )
+    connection.commit()
+
+
 def record_resource_access(
     database_path: str,
     context: dict[str, Any],
@@ -250,15 +384,17 @@ def record_resource_access(
                     message,
                     source_kind,
                     user_agent,
+                    ua_family,
                     ip_hash,
                     likely_crawler,
                     token_used
-                ) VALUES (?, 'resource', ?, NULL, NULL, 'none', ?, ?, ?, 0)
+                ) VALUES (?, 'resource', ?, NULL, NULL, 'none', ?, ?, ?, ?, 0)
                 """,
                 (
                     context["ts"],
                     path,
                     context["user_agent"],
+                    context.get("ua_family", ""),
                     context["ip_hash"],
                     int(context["likely_crawler"]),
                 ),
@@ -267,28 +403,17 @@ def record_resource_access(
         except sqlite3.IntegrityError as exc:
             connection.rollback()
             if _is_legacy_event_type_check_error(exc):
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    """
-                    INSERT INTO resource_reads (
-                        ts,
-                        path,
-                        user_agent,
-                        ip_hash,
-                        likely_crawler
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        context["ts"],
-                        path,
-                        context["user_agent"],
-                        context["ip_hash"],
-                        int(context["likely_crawler"]),
-                    ),
-                )
-                connection.commit()
+                _insert_legacy_resource_read(connection, context, path)
                 return
             raise
+        except sqlite3.OperationalError as exc:
+            connection.rollback()
+            if "ua_family" not in str(exc) or not _table_exists(connection, "resource_reads"):
+                raise
+            # A database that predates the ua_family column and never ran the
+            # startup migration keeps the legacy fallback behaviour.
+            _insert_legacy_resource_read(connection, context, path)
+            return
         except Exception:
             connection.rollback()
             raise
@@ -337,14 +462,16 @@ def record_fetch_and_issue_token(
                     message,
                     source_kind,
                     user_agent,
+                    ua_family,
                     ip_hash,
                     likely_crawler,
                     token_used
-                ) VALUES (?, 'fetch', '/agent.txt', NULL, NULL, 'none', ?, ?, ?, 0)
+                ) VALUES (?, 'fetch', '/agent.txt', NULL, NULL, 'none', ?, ?, ?, ?, 0)
                 """,
                 (
                     context["ts"],
                     context["user_agent"],
+                    context.get("ua_family", ""),
                     context["ip_hash"],
                     int(context["likely_crawler"]),
                 ),
@@ -435,6 +562,49 @@ def record_hi_post(
     )
 
 
+def record_rejected_token(
+    database_path: str,
+    context: dict[str, Any],
+    *,
+    reason: str = "invalid_or_expired",
+) -> None:
+    """Record a follow-through attempt that presented an unusable token.
+
+    These attempts live in their own table so they never inflate the accepted
+    `hi_*` counters, while still being visible as a near-miss signal.
+    """
+
+    with create_connection(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO rejected_tokens (ts, ip_hash, user_agent, ua_family, reason)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    context["ts"],
+                    context["ip_hash"],
+                    context["user_agent"],
+                    context.get("ua_family", ""),
+                    reason,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def count_rejected_tokens(database_path: str) -> int:
+    with create_connection(database_path) as connection:
+        return int(
+            connection.execute(
+                "SELECT COUNT(*) AS hit_count FROM rejected_tokens"
+            ).fetchone()["hit_count"]
+        )
+
+
 def list_events(
     database_path: str,
     *,
@@ -498,11 +668,12 @@ def list_events(
                     LOWER(COALESCE(agent_name, '')) LIKE ?
                     OR LOWER(COALESCE(message, '')) LIKE ?
                     OR LOWER(COALESCE(user_agent, '')) LIKE ?
+                    OR LOWER(COALESCE(ua_family, '')) LIKE ?
                 )
                 """
             )
             search_term = f"%{q.lower()}%"
-            params.extend([search_term, search_term, search_term])
+            params.extend([search_term, search_term, search_term, search_term])
 
         where_clause = ""
         if conditions:
@@ -519,6 +690,7 @@ def list_events(
                 message,
                 source_kind,
                 user_agent,
+                ua_family,
                 likely_crawler,
                 token_used
             FROM events
@@ -529,6 +701,27 @@ def list_events(
             (*params, limit),
         ).fetchall()
         resource_count = _count_resource_rows(connection)
+        rejected_token_count = int(
+            connection.execute(
+                "SELECT COUNT(*) AS hit_count FROM rejected_tokens"
+            ).fetchone()["hit_count"]
+        )
+        self_test_count = _count_events(connection, "ua_family = ?", (SELF_TEST_UA_FAMILY,))
+        non_self_fetch_count = _count_events(
+            connection,
+            "event_type = 'fetch' AND ua_family != ?",
+            (SELF_TEST_UA_FAMILY,),
+        )
+        non_self_hi_total_count = _count_events(
+            connection,
+            "event_type IN ('hi_get', 'hi_post') AND ua_family != ?",
+            (SELF_TEST_UA_FAMILY,),
+        )
+        non_self_hi_unknown_count = _count_events(
+            connection,
+            "event_type IN ('hi_get', 'hi_post') AND source_kind = 'unknown' AND ua_family != ?",
+            (SELF_TEST_UA_FAMILY,),
+        )
 
     refresh = _refresh_payload(now)
     counters = {
@@ -544,8 +737,13 @@ def list_events(
         "fetch_unique_utc_day": int(stats["fetch_unique_utc_day"]),
         "hi_total_unique_utc_day": int(stats["hi_total_unique_utc_day"]),
         "hi_post_token_unique_utc_day": int(stats["hi_post_token_unique_utc_day"]),
-        "ratio_total": _fetch_per_hi_ratio(stats["fetch_count"], stats["hi_total_count"]),
-        "ratio_unknown": _ratio(stats["hi_unknown_count"], stats["fetch_count"]),
+        "hi_post_expired": rejected_token_count,
+        "self_test_events": self_test_count,
+        "fetch_excluding_self_test": non_self_fetch_count,
+        "hi_total_excluding_self_test": non_self_hi_total_count,
+        "ratio_basis": "excluding_self_test",
+        "ratio_total": _fetch_per_hi_ratio(non_self_fetch_count, non_self_hi_total_count),
+        "ratio_unknown": _ratio(non_self_hi_unknown_count, non_self_fetch_count),
     }
     events = [
         {
@@ -557,6 +755,7 @@ def list_events(
             "message": row["message"],
             "source_kind": row["source_kind"],
             "user_agent": row["user_agent"],
+            "ua_family": row["ua_family"],
             "likely_crawler": bool(row["likely_crawler"]),
             "token_used": bool(row["token_used"]),
         }
@@ -680,6 +879,9 @@ def _record_hi_event(
 ) -> dict[str, Any]:
     event_type = "hi_get" if signal == "hi_get" else "hi_post"
     token_used = 1 if token else 0
+    if source_kind in {"none", "unknown"} and context.get("ua_family") == SELF_TEST_UA_FAMILY:
+        # Self-test traffic (curl and friends) must never be read as an agent signal.
+        source_kind = "manual"
 
     with create_connection(database_path) as connection:
         try:
@@ -740,10 +942,11 @@ def _record_hi_event(
                     message,
                     source_kind,
                     user_agent,
+                    ua_family,
                     ip_hash,
                     likely_crawler,
                     token_used
-                ) VALUES (?, ?, '/hi', ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, '/hi', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     context["ts"],
@@ -752,6 +955,7 @@ def _record_hi_event(
                     message,
                     source_kind,
                     context["user_agent"],
+                    context.get("ua_family", ""),
                     context["ip_hash"],
                     int(context["likely_crawler"]),
                     token_used,
@@ -833,6 +1037,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             message TEXT,
             source_kind TEXT NOT NULL CHECK (source_kind IN ('none', 'unknown', 'manual', 'agent')),
             user_agent TEXT NOT NULL DEFAULT '',
+            ua_family TEXT NOT NULL DEFAULT '',
             ip_hash TEXT NOT NULL,
             likely_crawler INTEGER NOT NULL CHECK (likely_crawler IN (0, 1)),
             token_used INTEGER NOT NULL CHECK (token_used IN (0, 1))
@@ -888,6 +1093,18 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS rejected_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            ip_hash TEXT NOT NULL,
+            user_agent TEXT NOT NULL DEFAULT '',
+            ua_family TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS endpoint_hits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -927,10 +1144,24 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_endpoint_hits_endpoint_ip_ts ON endpoint_hits(endpoint, ip_hash, ts DESC)"
     )
     connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rejected_tokens_id ON rejected_tokens(id DESC)"
+    )
+    connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_source_windows_day_ip_event_token ON source_windows(window_day, ip_hash, event_type, token_used)"
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_resource_reads_path_id ON resource_reads(path, id DESC)"
+    )
+
+
+def _ensure_events_ua_family_column(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(events)").fetchall()}
+    if "ua_family" not in columns:
+        connection.execute(
+            "ALTER TABLE events ADD COLUMN ua_family TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_ua_family_id ON events(ua_family, id DESC)"
     )
 
 
@@ -951,6 +1182,7 @@ def _migrate_events_table_for_resource_support(connection: sqlite3.Connection) -
                 message TEXT,
                 source_kind TEXT NOT NULL CHECK (source_kind IN ('none', 'unknown', 'manual', 'agent')),
                 user_agent TEXT NOT NULL DEFAULT '',
+                ua_family TEXT NOT NULL DEFAULT '',
                 ip_hash TEXT NOT NULL,
                 likely_crawler INTEGER NOT NULL CHECK (likely_crawler IN (0, 1)),
                 token_used INTEGER NOT NULL CHECK (token_used IN (0, 1))
@@ -968,6 +1200,7 @@ def _migrate_events_table_for_resource_support(connection: sqlite3.Connection) -
                 message,
                 source_kind,
                 user_agent,
+                ua_family,
                 ip_hash,
                 likely_crawler,
                 token_used
@@ -981,6 +1214,7 @@ def _migrate_events_table_for_resource_support(connection: sqlite3.Connection) -
                 message,
                 source_kind,
                 user_agent,
+                '',
                 ip_hash,
                 likely_crawler,
                 token_used
@@ -1724,9 +1958,13 @@ def _rebuild_source_windows_for_day(connection: sqlite3.Connection, window_day: 
         )
 
 
-def _count_events(connection: sqlite3.Connection, where_clause: str) -> int:
+def _count_events(
+    connection: sqlite3.Connection,
+    where_clause: str,
+    params: tuple[Any, ...] = (),
+) -> int:
     query = f"SELECT COUNT(*) AS hit_count FROM events WHERE {where_clause}"
-    return int(connection.execute(query).fetchone()["hit_count"])
+    return int(connection.execute(query, params).fetchone()["hit_count"])
 
 
 def _count_resource_rows(connection: sqlite3.Connection) -> int:

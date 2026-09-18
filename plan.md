@@ -157,7 +157,7 @@ Token-validated `POST /hi` remains `event_type = hi_post`, but it must also set 
 - `GET /agent.txt` returns one token
 - the token is a bearer token in MVP
 - the token is optional to use
-- token lifetime is 1 minute
+- token lifetime is 10 minutes
 - token is single-use
 - token is never re-issued by `GET /hi` or `POST /hi`
 - a token is expired when `current_time >= expires_at`
@@ -202,7 +202,7 @@ Purpose:
 - logs `fetch`
 - returns the recipe
 - returns clear instructions for both follow-through paths
-- returns a one-time token valid for 1 minute
+- returns a one-time token valid for 10 minutes
 
 The instructions should say clearly:
 

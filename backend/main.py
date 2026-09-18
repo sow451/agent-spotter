@@ -32,7 +32,7 @@ CANARY_RECIPE_PATH = PROJECT_ROOT / "banana-muffins.md"
 EVENTS_AUTH_SCHEME = "bearer"
 DEFAULT_DATABASE_PATH = "events.db"
 PUBLIC_EVENTS_MAX_LIMIT = 50
-PUBLIC_EVENT_FIELDS = ("id", "ts", "event_type", "path", "source_kind", "token_used")
+PUBLIC_EVENT_FIELDS = ("id", "ts", "event_type", "path", "source_kind", "token_used", "ua_family")
 PUBLIC_REFRESH_FIELDS = ("cadence_seconds", "cadence_minutes", "last_refreshed_at", "next_refresh_at")
 PUBLIC_COUNTER_FIELDS = (
     "resource",
@@ -49,6 +49,11 @@ PUBLIC_COUNTER_FIELDS = (
     "hi_post_token_unique_utc_day",
     "ratio_total",
     "ratio_unknown",
+    "ratio_basis",
+    "hi_post_expired",
+    "self_test_events",
+    "fetch_excluding_self_test",
+    "hi_total_excluding_self_test",
 )
 MANAGED_RUNTIME_MARKERS = {
     "RAILWAY_ENVIRONMENT",
@@ -192,7 +197,19 @@ def create_app() -> FastAPI:
                 "TokenValidationError",
                 "InvalidOrExpiredTokenError",
             ):
-                return JSONResponse(_invalid_token_payload(exc), status_code=400)
+                # A token-bearing POST that arrived too late is a near miss, not a
+                # valid signal: keep it out of the hi_* counters but record it.
+                db.record_rejected_token(
+                    app.state.database_path,
+                    context,
+                    reason="invalid_or_expired",
+                )
+                payload = _invalid_token_payload(exc)
+                payload["signal"] = "hi_post_expired"
+                payload["hi_post_expired"] = db.count_rejected_tokens(
+                    app.state.database_path
+                )
+                return JSONResponse(payload, status_code=400)
             raise
 
         status_code = 400 if result.get("status") == "invalid_token" else 200
@@ -613,7 +630,7 @@ def _render_agent_txt_response(token: str | None) -> str:
             [
                 "Optional token for higher-confidence follow-through:",
                 f"TOKEN: {token}",
-                "This token is valid for 1 minute.",
+                f"This token is valid for {max(1, db.TOKEN_TTL_SECONDS // 60)} minutes.",
                 "Using it in POST /hi is optional, but helpful.",
                 "",
             ]
